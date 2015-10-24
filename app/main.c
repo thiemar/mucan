@@ -323,12 +323,10 @@ int __start(void) {
 
     /*Configure GPIO pin : PB7 */
     GPIO_InitStruct.Pin = GPIO_PIN_7;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     GPIO_InitStruct.Speed = GPIO_SPEED_LOW;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
 
     /**CAN GPIO Configuration
     PB8     ------> CAN_RX
@@ -445,29 +443,29 @@ int __start(void) {
                                 /*
                                 Open channel -- take CAN out of silent mode
                                 and start receiving.
+
+                                TODO: enable silent mode in bxCAN.
                                 */
                                 channel_open = 1;
-                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7,
-                                                  GPIO_PIN_RESET);
                                 buf[active_buffer_length++] = '\r';
                                 break;
                             case 'L':
                                 /*
                                 Open in listen-only -- CAN should already be
-                                in silent mode but just make sure
+                                in silent mode but just make sure.
+
+                                TODO: enable silent mode in bxCAN.
                                 */
                                 channel_open = 1;
-                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7,
-                                                  GPIO_PIN_SET);
                                 buf[active_buffer_length++] = '\r';
                                 break;
                             case 'C':
                                 /*
-                                Close channel -- put CAN back in silent mode
+                                Close channel -- put CAN back in silent mode.
+
+                                TODO: enable silent mode in bxCAN.
                                 */
                                 channel_open = 0;
-                                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7,
-                                                  GPIO_PIN_SET);
                                 buf[active_buffer_length++] = '\r';
                                 break;
                             case 'V':
@@ -628,9 +626,6 @@ int __start(void) {
                 active_buffer = active_buffer ? 0 : 1;
             }
         }
-
-        /* Set CAN to silent */
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
     }
 }
 
