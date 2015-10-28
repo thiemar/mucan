@@ -141,6 +141,25 @@ static uint8_t write_ext_message(uint8_t *dest, CanRxMsgTypeDef *msg) {
 }
 
 
+static uint8_t write_ext_rtr(uint8_t *dest, CanRxMsgTypeDef *msg) {
+    *dest++ = 'R';
+
+    /* Message ID, 00000000-1FFFFFFF */
+    *dest++ = hex_chars[(msg->ExtId >> 28u) & 0xFu];
+    *dest++ = hex_chars[(msg->ExtId >> 24u) & 0xFu];
+    *dest++ = hex_chars[(msg->ExtId >> 20u) & 0xFu];
+    *dest++ = hex_chars[(msg->ExtId >> 16u) & 0xFu];
+    *dest++ = hex_chars[(msg->ExtId >> 12u) & 0xFu];
+    *dest++ = hex_chars[(msg->ExtId >>  8u) & 0xFu];
+    *dest++ = hex_chars[(msg->ExtId >>  4u) & 0xFu];
+    *dest++ = hex_chars[(msg->ExtId >>  0u) & 0xFu];
+
+    *dest++ = '\r';
+
+    return 1u + 8u + 1u;
+}
+
+
 static uint8_t write_std_message(uint8_t *dest, CanRxMsgTypeDef *msg) {
     uint8_t i;
 
@@ -163,6 +182,20 @@ static uint8_t write_std_message(uint8_t *dest, CanRxMsgTypeDef *msg) {
     *dest++ = '\r';
 
     return 1u + 3u + 1u + (msg->DLC << 1u) + 1u;
+}
+
+
+static uint8_t write_std_rtr(uint8_t *dest, CanRxMsgTypeDef *msg) {
+    *dest++ = 'r';
+
+    /* Message ID, 000-7FF */
+    *dest++ = hex_chars[(msg->StdId >>  8u) & 0xFu];
+    *dest++ = hex_chars[(msg->StdId >>  4u) & 0xFu];
+    *dest++ = hex_chars[(msg->StdId >>  0u) & 0xFu];
+
+    *dest++ = '\r';
+
+    return 1u + 3u + 1u;
 }
 
 
@@ -196,6 +229,28 @@ static uint8_t read_ext_message(CanTxMsgTypeDef *dest, uint8_t *msg,
 }
 
 
+static uint8_t read_ext_rtr(CanTxMsgTypeDef *dest, uint8_t *msg,
+                            uint8_t msg_length) {
+    if (msg[0] > '1' || msg[8] < '0' || msg[8] > '8' || msg_length != 8u) {
+        return 0;
+    }
+
+    dest->ExtId = (nibble_from_hex(msg[0]) << 28u) |
+                  (nibble_from_hex(msg[1]) << 24u) |
+                  (nibble_from_hex(msg[2]) << 20u) |
+                  (nibble_from_hex(msg[3]) << 16u) |
+                  (nibble_from_hex(msg[4]) << 12u) |
+                  (nibble_from_hex(msg[5]) <<  8u) |
+                  (nibble_from_hex(msg[6]) <<  4u) |
+                  (nibble_from_hex(msg[7]) <<  0u);
+    dest->IDE = CAN_ID_EXT;
+    dest->RTR = 1u;
+    dest->DLC = 0;
+
+    return 1u;
+}
+
+
 static uint8_t read_std_message(CanTxMsgTypeDef *dest, uint8_t *msg,
                                 uint8_t msg_length) {
     uint8_t i;
@@ -216,6 +271,23 @@ static uint8_t read_std_message(CanTxMsgTypeDef *dest, uint8_t *msg,
         dest->Data[i] = (nibble_from_hex(msg[4u + (i << 1u)]) << 4u) |
                         (nibble_from_hex(msg[4u + (i << 1u) + 1u]) << 0u);
     }
+
+    return 1u;
+}
+
+
+static uint8_t read_std_rtr(CanTxMsgTypeDef *dest, uint8_t *msg,
+                            uint8_t msg_length) {
+    if (msg[0] > '7' || msg[3] < '0' || msg[3] > '8' || msg_length != 3u) {
+        return 0;
+    }
+
+    dest->StdId = (nibble_from_hex(msg[0]) <<  8u) |
+                  (nibble_from_hex(msg[1]) <<  4u) |
+                  (nibble_from_hex(msg[2]) <<  0u);
+    dest->IDE = CAN_ID_STD;
+    dest->RTR = 1u;
+    dest->DLC = 0;
 
     return 1u;
 }
@@ -534,6 +606,26 @@ int __start(void) {
                                     buf[active_buffer_length++] = '\a';
                                 }
                                 break;
+                            case 'R':
+                                /* Extended RTR */
+                                if (read_ext_rtr(&tx_msg, current_cmd_data,
+                                                 current_cmd_data_length) &&
+                                        HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
+                                    buf[active_buffer_length++] = '\r';
+                                } else {
+                                    buf[active_buffer_length++] = '\a';
+                                }
+                                break;
+                            case 'r':
+                                /* Standard RTR */
+                                if (read_std_rtr(&tx_msg, current_cmd_data,
+                                                 current_cmd_data_length) &&
+                                        HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
+                                    buf[active_buffer_length++] = '\r';
+                                } else {
+                                    buf[active_buffer_length++] = '\a';
+                                }
+                                break;
                             case '_':
                                 /* Bootloader request */
                                 if (current_cmd_data[0] == '_' &&
@@ -550,10 +642,6 @@ int __start(void) {
                                     buf[active_buffer_length++] = '\a';
                                 }
                                 break;
-                            case 'R':
-                                /* Extended RTR */
-                            case 'r':
-                                /* Standard RTR */
                             case 'F':
                                 /* Read status flags -- return 4 hex digits */
                             case 'Z':
@@ -609,27 +697,39 @@ int __start(void) {
                 The data format for a standard ID message is:
                 tiiildddddddddddddddd\r
 
+                The data format for a standard ID RTR is:
+                riii\r
+
                 The data format for an extended ID message is:
                 Tiiiiiiiildddddddddddddddd\r
+
+                The data format for an extended ID RTR is:
+                Riiiiiiii\r
                 */
-                if (rx_msg.IDE == CAN_ID_EXT) {
-                    if (active_buffer_length + EXT_MESSAGE_LEN > TX_BUFFER_SIZE) {
-                        /* Reset buffer if we're too far behind */
-                        active_buffer_length = 0;
-                    }
+                uint8_t *write_location;
 
+                if (active_buffer_length + EXT_MESSAGE_LEN > TX_BUFFER_SIZE) {
+                    /*
+                    Reset buffer if we're too far behind -- use worst-case
+                    message length for calculation
+                    */
+                    active_buffer_length = 0;
+                }
+
+                write_location = &((active_buffer ? tx_buffer_1 : tx_buffer_0)[active_buffer_length]);
+
+                if (rx_msg.IDE == CAN_ID_EXT && rx_msg.RTR) {
+                    active_buffer_length += write_ext_rtr(
+                        write_location, &rx_msg);
+                } else if (rx_msg.IDE == CAN_ID_EXT && !rx_msg.RTR) {
                     active_buffer_length += write_ext_message(
-                        &((active_buffer ? tx_buffer_1 : tx_buffer_0)[active_buffer_length]),
-                        &rx_msg);
-                } else {
-                    if (active_buffer_length + STD_MESSAGE_LEN > TX_BUFFER_SIZE) {
-                        /* Reset buffer if we're too far behind */
-                        active_buffer_length = 0;
-                    }
-
+                        write_location, &rx_msg);
+                } else if (rx_msg.IDE == CAN_ID_STD && rx_msg.RTR) {
+                    active_buffer_length += write_std_rtr(
+                        write_location, &rx_msg);
+                } else if (rx_msg.IDE == CAN_ID_STD && !rx_msg.RTR) {
                     active_buffer_length += write_std_message(
-                        &((active_buffer ? tx_buffer_1 : tx_buffer_0)[active_buffer_length]),
-                        &rx_msg);
+                        write_location, &rx_msg);
                 }
             }
 
