@@ -144,7 +144,7 @@ static uint8_t write_ext_message(uint8_t *dest, CanRxMsgTypeDef *msg) {
 static uint8_t write_std_message(uint8_t *dest, CanRxMsgTypeDef *msg) {
     uint8_t i;
 
-    *dest++ = 'T';
+    *dest++ = 't';
 
     /* Message ID, 000-7FF */
     *dest++ = hex_chars[(msg->StdId >>  8u) & 0xFu];
@@ -205,10 +205,10 @@ static uint8_t read_std_message(CanTxMsgTypeDef *dest, uint8_t *msg,
         return 0;
     }
 
-    dest->ExtId = (nibble_from_hex(msg[0]) <<  8u) |
+    dest->StdId = (nibble_from_hex(msg[0]) <<  8u) |
                   (nibble_from_hex(msg[1]) <<  4u) |
                   (nibble_from_hex(msg[2]) <<  0u);
-    dest->IDE = CAN_ID_EXT;
+    dest->IDE = CAN_ID_STD;
     dest->RTR = 0;
     dest->DLC = msg[3] - '0';
 
@@ -245,6 +245,16 @@ static uint8_t set_can_bitrate(CAN_HandleTypeDef *hcan, uint32_t bitrate) {
 
     HAL_CAN_Init(hcan);
     return 1u;
+}
+
+
+static void set_can_silent(CAN_HandleTypeDef *hcan, uint8_t silent) {
+    if (silent) {
+        hcan->Init.Mode = CAN_MODE_SILENT;
+    } else {
+        hcan->Init.Mode = CAN_MODE_NORMAL;
+    }
+    HAL_CAN_Init(hcan);
 }
 
 
@@ -345,7 +355,7 @@ int __start(void) {
     __CAN_CLK_ENABLE();
 
     hcan.Instance = CAN;
-    hcan.Init.Mode = CAN_MODE_NORMAL;
+    hcan.Init.Mode = CAN_MODE_SILENT;
     hcan.Init.TTCM = DISABLE;
     hcan.Init.ABOM = ENABLE;
     hcan.Init.AWUM = ENABLE;
@@ -443,30 +453,39 @@ int __start(void) {
                                 /*
                                 Open channel -- take CAN out of silent mode
                                 and start receiving.
-
-                                TODO: enable silent mode in bxCAN.
                                 */
-                                channel_open = 1;
-                                buf[active_buffer_length++] = '\r';
+                                if (!channel_open) {
+                                    channel_open = 1;
+                                    set_can_silent(&hcan, 0);
+                                    buf[active_buffer_length++] = '\r';
+                                } else {
+                                    buf[active_buffer_length++] = '\a';
+                                }
                                 break;
                             case 'L':
                                 /*
                                 Open in listen-only -- CAN should already be
                                 in silent mode but just make sure.
-
-                                TODO: enable silent mode in bxCAN.
                                 */
-                                channel_open = 1;
-                                buf[active_buffer_length++] = '\r';
+                                if (!channel_open) {
+                                    channel_open = 1;
+                                    set_can_silent(&hcan, 1);
+                                    buf[active_buffer_length++] = '\r';
+                                } else {
+                                    buf[active_buffer_length++] = '\a';
+                                }
                                 break;
                             case 'C':
                                 /*
                                 Close channel -- put CAN back in silent mode.
-
-                                TODO: enable silent mode in bxCAN.
                                 */
-                                channel_open = 0;
-                                buf[active_buffer_length++] = '\r';
+                                if (channel_open) {
+                                    channel_open = 0;
+                                    set_can_silent(&hcan, 1);
+                                    buf[active_buffer_length++] = '\r';
+                                } else {
+                                    buf[active_buffer_length++] = '\a';
+                                }
                                 break;
                             case 'V':
                                 /* Hardware version */

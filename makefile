@@ -80,7 +80,7 @@ PROJECT_INC_PATHS = -Iapp/ -Isys/ -Iusb/
 PROJECT_LIB_PATHS = -L.
 PROJECT_LIBRARIES =
 PROJECT_SYMBOLS   = -DTOOLCHAIN_GCC_ARM -DNO_RELOC='0' -DSTM32F042x6
-PROJECT_LD_FLAGS  = --specs=nosys.specs
+PROJECT_LD_FLAGS  = --specs=nano.specs
 
 
 ###############################################################################
