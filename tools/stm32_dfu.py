@@ -2,8 +2,9 @@
 
 Protocol: ST AN3156, sections 2--5. Each transfer resets the address pointer
 and uses block 2, including the final short block: the ROM computes addresses
-using the current request length, not a fixed transfer size. Option bytes are
-read-only here. Only the explicit recover() operation sends Read Unprotect.
+using the current request length, not a fixed transfer size. write_options()
+programs the 16-byte option block but refuses to change read protection; only
+the explicit recover() operation sends Read Unprotect.
 """
 
 from contextlib import contextmanager
@@ -141,6 +142,24 @@ class _Session:
     def address(self, address):
         self.download(0, b"\x21" + struct.pack("<I", address))
 
+    def download_then_reset(self, block, data):
+        """Download a block whose execution resets the device (an option-byte
+        write reloads the options with a system reset). Losing the device
+        while it is busy is the expected outcome; the caller re-enumerates
+        and verifies by reading back."""
+        self.transfer(DNLOAD, block, data)
+        try:
+            _, delay, state = self.status()
+            while state == DNBUSY:
+                self.delay(delay)
+                _, delay, state = self.status()
+        except self.tool.usb_error as exc:
+            if exc.code not in (-4, -7, -9):
+                raise
+            return
+        if state not in (DNLOAD_IDLE, MANIFEST):
+            raise FlashError(f"ROM did not complete the option write (state {state})")
+
     def reset_command(self, data, expected_state):
         self.transfer(DNLOAD, 0, data)
         try:
@@ -251,8 +270,27 @@ class DfuTool:
                 session.abort()  # A subsequent SET_ADDRESS requires download/idle state.
         return bytes(result)
 
+    def option_block(self, device):
+        """The whole 16-byte option block; the F042 implements the first ten."""
+        return self.read(device, OPTION_BASE, 16, alt=1)
+
     def options(self, device):
-        return self.read(device, OPTION_BASE, 16, alt=1)[:10]
+        return self.option_block(device)[:10]
+
+    def write_options(self, device, block):
+        """Program the option block through alt 1 (AN3156). The ROM erases
+        the option bank itself and then resets to load the new values, so
+        the device disconnects; re-enumerate and read back to confirm."""
+        block = bytes(block)
+        if len(block) != 16:
+            raise FlashError("Option write must cover the complete 16-byte block")
+        if block[:2] != b"\xaa\x55":
+            raise FlashError("Option write would change read protection; refusing")
+        if any(block[i] ^ block[i + 1] != 0xFF for i in range(0, 10, 2)):
+            raise FlashError("Option write needs valid byte/complement pairs")
+        with self.session(device, alt=1) as session:
+            session.address(OPTION_BASE)
+            session.download_then_reset(2, block)
 
     def uid(self, device):
         raw = self.read(device, UID_BASE, 12)

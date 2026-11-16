@@ -55,6 +55,8 @@ class Rom:
         self.malformed_status = False
         self.reset_error = None
         self.download_error = None
+        self.option_reset = None  # USB error once an option write executes
+        self.option_writes = 0
 
     def open(self):
         self.open_count += 1
@@ -158,6 +160,16 @@ class Rom:
                 self.flash[offset:offset + 1024] = b"\xff" * 1024
             else:
                 raise AssertionError(f"Unexpected command {command}")
+        elif self.alt == 1:
+            # AN3156 option write: the ROM erases and programs the whole
+            # block itself, then resets to load it
+            assert block == 2 and self.pointer == dfu.OPTION_BASE and len(payload) == 16
+            self.options = payload
+            self.option_writes += 1
+            self.state = dfu.DNLOAD_IDLE
+            if self.option_reset:
+                raise UsbError(self.option_reset)
+            return
         else:
             address = self.pointer + (block - 2) * len(payload)
             offset = address - dfu.FLASH_BASE
@@ -275,6 +287,37 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual([(e[2], e[4]) for e in downloads],
                          [(0, b"\x21" + struct.pack("<I", dfu.FLASH_BASE)), (0, b"")])
         self.assertEqual(self.rom.state, dfu.MANIFEST)
+
+    @staticmethod
+    def rom_block():
+        return bytes.fromhex("AA55778812ED34CBFF00") + b"\xff" * 6
+
+    def test_option_write_sets_address_then_one_block_on_alt_one(self):
+        for reset in (None, -4, -7, -9):  # the ROM normally resets to load options
+            with self.subTest(reset=reset):
+                self.rom.state, self.rom.status = dfu.DFU_IDLE, 0
+                self.rom.trace.clear()
+                self.rom.option_reset = reset
+                self.tool.write_options(self.device, self.rom_block())
+                self.assertEqual(self.rom.options, self.rom_block())
+                self.assertIn(("alt", 1), self.rom.trace)
+                self.assertEqual([(e[2], e[4]) for e in self.transfers(dfu.DNLOAD)],
+                                 [(0, b"\x21" + struct.pack("<I", dfu.OPTION_BASE)),
+                                  (2, self.rom_block())])
+        self.assertEqual(self.rom.option_writes, 4)
+
+    def test_option_write_other_usb_errors_fail(self):
+        self.rom.option_reset = -1
+        with self.assertRaisesRegex(dfu.FlashError, "USB transfer failed"):
+            self.tool.write_options(self.device, self.rom_block())
+
+    def test_option_write_refuses_protection_changes_and_bad_pairs(self):
+        good = self.rom_block()
+        for bad in (good[:15], b"\xbb\x44" + good[2:], b"\xcc\x33" + good[2:],
+                    good[:2] + b"\x77\x89" + good[4:]):
+            with self.subTest(bad=bad.hex()), self.assertRaises(dfu.FlashError):
+                self.tool.write_options(self.device, bad)
+        self.assertEqual(self.rom.trace, [])
 
     def test_recover_is_the_only_unprotect_command(self):
         self.tool.recover(self.device)

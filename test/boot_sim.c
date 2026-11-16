@@ -11,7 +11,6 @@ FLASH_TypeDef boot_sim_flash;
 boot_sim_options_t boot_sim_ob;
 DBGMCU_TypeDef boot_sim_dbgmcu;
 IWDG_TypeDef boot_sim_iwdg;
-GPIO_TypeDef boot_sim_gpiof;
 boot_sim_systick_t boot_sim_systick;
 boot_sim_nvic_t boot_sim_nvic;
 boot_sim_scb_t boot_sim_scb;
@@ -60,8 +59,6 @@ void boot_sim_init(uint8_t user, uint8_t rdp) {
     memset(&boot_sim_flash, 0, sizeof boot_sim_flash);
     memset(&boot_sim_ob, 0xFF, sizeof boot_sim_ob);
     memset(&boot_sim_iwdg, 0, sizeof boot_sim_iwdg);
-    memset(&boot_sim_gpiof, 0, sizeof boot_sim_gpiof);
-    boot_sim_gpiof.IDR = 1u << 11; /* production boards tie BOOT0 high */
     memset(&boot_sim_systick, 0, sizeof boot_sim_systick);
     memset(&boot_sim_nvic, 0, sizeof boot_sim_nvic);
     memset(&boot_sim_scb, 0, sizeof boot_sim_scb);

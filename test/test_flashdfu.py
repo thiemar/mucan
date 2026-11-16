@@ -41,7 +41,7 @@ class FakeBoard:
         self.dfu = True
         self.app = False
         self.cycle = 0
-        self.version = b"v0003"
+        self.version = b"v0004"
         self.other_devices = []
         self.on_event = lambda event: None
         self.readback_corrupt = False
@@ -54,6 +54,8 @@ class FakeBoard:
         self.commit_failure = False
         self.handshake_failure = False
         self.dfu_rejected = False
+        self.options_write_failure = False
+        self.options_write_ignored = False
         self.option_reply = None
         self.layout = "032*0001Kg"
         self.targets = []
@@ -119,8 +121,19 @@ class FakeBoard:
             raise flashdfu.FlashError("Short/oversized DFU upload")
         return payload
 
+    def option_block(self, device):
+        return self.read(device, flashdfu.OPTION_BASE, 16, alt=1)
+
     def options(self, device):
-        return self.read(device, flashdfu.OPTION_BASE, 16, alt=1)[:10]
+        return self.option_block(device)[:10]
+
+    def write_options(self, device, block):
+        self.selected(device, "options")
+        self.event("options", bytes(block[:10]).hex().upper())
+        if self.options_write_failure:
+            raise flashdfu.FlashError("DFU option write failed")
+        if not self.options_write_ignored:
+            self.options_raw = bytes(block[:10])
 
     def uid(self, device):
         return self.read(device, flashdfu.UID_BASE, 12).hex().upper()
@@ -185,9 +198,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.committed())
 
     def test_development_verifies_all_bytes_and_leaves_rom_selected(self):
-        original = self.board.options_raw
         self.run_update()
-        self.assertEqual(self.board.options_raw, original)
+        # Factory USER=FF (BOOT0 pin decides; tied low) becomes USER=77
+        self.assertEqual(self.board.options_raw, bytes.fromhex("AA55778812ED34CBFF00"))
+        options = self.board.events.index(("options", "AA55778812ED34CBFF00"))
+        first_write = next(i for i, e in enumerate(self.board.events) if e[0] == "write")
+        self.assertLess(options, first_write)
         self.assertFalse(self.committed())
         self.assertIn(("read", flashdfu.FLASH_BASE, len(firmware())), self.board.events)
         self.assertLess(self.board.events.index(("read", flashdfu.FLASH_BASE, len(firmware()))),
@@ -202,7 +218,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(self.board.events.index(("read", flashdfu.FLASH_BASE, len(firmware()))), commit)
         self.assertLess(self.board.events.index(("command", b"v")), commit)
         self.assertLess(self.board.events.index(("command", b"__options")), commit)
-        self.assertEqual(self.board.options_raw, flashdfu.production_options(original))
+        rom = flashdfu.rom_option_block(original + b"\xff" * 6)[:10]
+        self.assertEqual(self.board.options_raw, flashdfu.production_options(rom))
+        self.assertEqual(self.board.options_raw[2:4], bytes([flashdfu.APP_USER, 0x80]))
         self.assertEqual(self.board.events.count(("command", b"__options")), 2)
         self.assertEqual(self.board.options_raw[4:], original[4:])
 
@@ -258,7 +276,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_old_version_or_bad_option_reply_never_commits(self):
         self.args.production = True
-        for version, reply in [(b"v0002", None), (b"garbage", None), (b"v0003", b"OBAA55")]:
+        for version, reply in [(b"v0003", None), (b"garbage", None), (b"v0004", b"OBAA55")]:
             with self.subTest(version=version, reply=reply):
                 self.board = FakeBoard()
                 self.tool = self.board
@@ -323,7 +341,7 @@ class WorkflowTests(unittest.TestCase):
                 self.assertEqual(self.board.events, [])
 
     def test_bad_options_stop_before_application_write(self):
-        for raw in ["FFFF" * 5, "CC33FF0012ED34CBFF00", "AA557F8012ED34CBFF00",
+        for raw in ["FFFF" * 5, "CC33FF0012ED34CBFF00",
                     "AA55FF0012ED34CBFE01", "AA00FF0012ED34CBFF00"]:
             with self.subTest(raw=raw):
                 self.board = FakeBoard()
@@ -332,13 +350,13 @@ class WorkflowTests(unittest.TestCase):
                 with self.assertRaises(flashdfu.FlashError):
                     self.run_update()
                 self.assert_no_write_or_commit()
+                self.assertFalse(any(e[0] == "options" for e in self.board.events))
                 self.assertNotIn(("recover",), self.board.events)
 
-    def test_interrupted_non_rdp_pairs_allow_development_with_effective_rom(self):
-        original = bytes.fromhex("AA55FF807FEDFFCBFF00")
-        self.board.options_raw = original
+    def test_interrupted_pairs_are_normalized_when_rom_is_selected(self):
+        self.board.options_raw = bytes.fromhex("AA55FF807FEDFFCBFF00")
         self.run_update()
-        self.assertEqual(self.board.options_raw, original)
+        self.assertEqual(self.board.options_raw, bytes.fromhex("AA557788FF00FF00FF00"))
         self.assertNotIn(("recover",), self.board.events)
         self.assertFalse(self.committed())
 
@@ -346,14 +364,33 @@ class WorkflowTests(unittest.TestCase):
         self.args.production = True
         self.board.options_raw = bytes.fromhex("AA55FF807FED34CBFF01")
         self.run_update()
-        self.assertEqual(self.board.options_raw, bytes.fromhex("AA557F80FFFF34CBFFFF"))
+        self.assertEqual(self.board.options_raw, bytes.fromhex("AA557F80FF0034CBFF00"))
         self.assertNotIn(("recover",), self.board.events)
 
-    def test_unsupported_production_profile_rejected_before_write(self):
+    def test_rom_already_selected_is_not_rewritten(self):
+        self.board.options_raw = bytes.fromhex("AA55778812ED34CBFF00")
+        self.run_update()
+        self.assertFalse(any(e[0] == "options" for e in self.board.events))
+        self.assertTrue(any(e[0] == "write" for e in self.board.events))
+
+    def test_unconfirmed_rom_selection_never_writes_flash(self):
+        for flag, message in (("options_write_failure", "option write failed"),
+                              ("options_write_ignored", "did not verify")):
+            with self.subTest(flag=flag):
+                self.board = FakeBoard()
+                self.tool = self.board
+                setattr(self.board, flag, True)
+                with self.assertRaisesRegex(flashdfu.FlashError, message):
+                    self.run_update()
+                self.assert_no_write_or_commit()
+                self.assertNotIn(("leave",), self.board.events)
+
+    def test_production_profile_checked_before_any_option_write(self):
         self.args.production = True
         self.board.options_raw = bytes.fromhex("AA55FD0212ED34CBFF00")
         with self.assertRaisesRegex(flashdfu.FlashError, "supported USER"):
             self.run_update()
+        self.assertFalse(any(e[0] == "options" for e in self.board.events))
         self.assert_no_write_or_commit()
 
     def test_explicit_recovery_reidentifies_path_and_revalidates(self):
@@ -399,7 +436,7 @@ class WorkflowTests(unittest.TestCase):
         self.board.dfu, self.board.app = False, True
         self.board.dfu_rejected = True
         self.args.device = self.board.port
-        with self.assertRaisesRegex(flashdfu.FlashError, "BOOT0"):
+        with self.assertRaisesRegex(flashdfu.FlashError, "refused to select ROM boot"):
             self.run_update()
         self.assertFalse(any(event[0] == "list" for event in self.board.events[1:]))
         self.assert_no_write_or_commit()
@@ -440,17 +477,25 @@ class WorkflowTests(unittest.TestCase):
         self.assert_no_write_or_commit()
 
     def test_uid_changes_before_download_are_rejected(self):
-        seen = 0
-        def swap(event):
-            nonlocal seen
-            if event == ("read", flashdfu.UID_BASE, 12):
-                seen += 1
-                if seen == 2:
-                    self.board.uid_raw = bytes.fromhex("0102030405060708090A0B0C")
-        self.board.on_event = swap
-        with self.assertRaisesRegex(flashdfu.FlashError, "identity/options changed"):
-            self.run_update()
-        self.assert_no_write_or_commit()
+        # Second UID read: the ROM-selection check, or (ROM already selected)
+        # the final preflight check
+        for options, message in (("AA55FF0012ED34CBFF00", "did not verify"),
+                                 ("AA55778812ED34CBFF00", "identity/options changed")):
+            with self.subTest(options=options):
+                self.board = FakeBoard()
+                self.tool = self.board
+                self.board.options_raw = bytes.fromhex(options)
+                seen = 0
+                def swap(event):
+                    nonlocal seen
+                    if event == ("read", flashdfu.UID_BASE, 12):
+                        seen += 1
+                        if seen == 2:
+                            self.board.uid_raw = bytes.fromhex("0102030405060708090A0B0C")
+                self.board.on_event = swap
+                with self.assertRaisesRegex(flashdfu.FlashError, message):
+                    self.run_update()
+                self.assert_no_write_or_commit()
 
 
 class CliTests(unittest.TestCase):
@@ -529,6 +574,26 @@ sys.exit(module.main(sys.argv[2:]))
         for value in ("nan", "inf", "-inf", "0", "121"):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 flashdfu.parse_args(["--timeout=" + value])
+
+
+class OptionTests(unittest.TestCase):
+    def test_rom_selection_uses_option_bits_only(self):
+        self.assertTrue(flashdfu.rom_selected(bytes.fromhex("AA55778812ED34CBFF00")))
+        for user in ("FF00", "7F80", "F708", "FFFF"):  # pin-decided, flash, BOOT_SEL=1, erased
+            self.assertFalse(flashdfu.rom_selected(bytes.fromhex("AA55" + user + "12ED34CBFF00")))
+
+    def test_rom_block_keeps_other_bits_and_trailing_bytes(self):
+        block = bytes.fromhex("AA55FB0412ED34CBFF00") + bytes.fromhex("A1B2C3D4E5F6")
+        rom = flashdfu.rom_option_block(block)
+        self.assertEqual(rom[2:4], bytes.fromhex("738C"))  # FB -> BOOT_SEL, nBOOT0 cleared
+        self.assertEqual(rom[:2] + rom[4:], block[:2] + block[4:])
+        self.assertTrue(flashdfu.rom_selected(rom[:10]))
+
+    def test_production_commit_is_rom_to_app(self):
+        self.assertEqual(flashdfu.production_options(bytes.fromhex("AA55778812ED34CBFF00")),
+                         bytes.fromhex("AA557F8012ED34CBFF00"))
+        with self.assertRaises(flashdfu.FlashError):
+            flashdfu.production_options(bytes.fromhex("AA55FF0012ED34CBFF00"))
 
 
 class SerialTransportTests(unittest.TestCase):

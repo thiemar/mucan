@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Stage, read back, and start µCAN firmware; only the app changes boot options.
+"""Select ROM boot, then stage, read back, and start µCAN firmware.
 
-Requires native libusb and pyserial. BOOT0 must be held high on this board.
-See AN3156 for DfuSe upload, leave and Read Unprotect, and RM0091 for the
-five STM32F042 option pairs. Never download to the option-byte address here.
+Requires native libusb and pyserial. BOOT0 is tied low on these boards, so once
+flash holds an image only the option bits (BOOT_SEL=0, nBOOT0=0: USER=0x77)
+can bring the adapter back to ROM DFU. That selection is written and verified
+through ROM DFU before any flash write. See AN3156 for DfuSe upload, option
+write, leave and Read Unprotect, and RM0091 for the five STM32F042 option pairs.
 """
 
 import argparse
@@ -22,6 +24,13 @@ OPTION_BLOCK_SIZE = 16  # ROM upload block size; only the first 10 bytes are imp
 UID_BASE = 0x1FFFF7AC
 APP_VID, APP_PID = 0x0483, 0x5740
 DFU_ID = "0483:df11"
+
+# USER option byte (RM0091 4.1): boot source selection bits
+USER_BOOT_SEL = 0x80  # 1: BOOT0 pin decides; 0: the nBOOT0 bit decides
+USER_NBOOT1 = 0x10
+USER_NBOOT0 = 0x08
+ROM_USER = 0x77  # BOOT_SEL=0, nBOOT0=0: ROM bootloader whatever BOOT0 does
+APP_USER = 0x7F  # BOOT_SEL=0, nBOOT0=1: application flash
 
 
 class CommitUnverified(FlashError):
@@ -55,7 +64,7 @@ def effective_options(raw):
     return bytes(normalized)
 
 
-def validate_options(raw, require_rom=True):
+def validate_options(raw):
     if len(raw) != 10:
         raise FlashError("Expected all five STM32F042 option pairs")
     if raw[:2] != b"\xaa\x55":
@@ -63,18 +72,34 @@ def validate_options(raw, require_rom=True):
     effective = effective_options(raw)
     if effective[8] != 0xFF:
         raise FlashError("Flash write protection is enabled; refusing to erase or alter it")
-    # BOOT_SEL, nBOOT1, nBOOT0, and software watchdog. BOOT0 is physically high.
-    if require_rom and effective[2] & 0x99 != 0x99:
-        raise FlashError("Persistent ROM boot is not selected; run the app's __dfu command first")
     return raw
 
 
+def rom_selected(raw):
+    """True if reset starts the ROM bootloader through the option bits alone."""
+    user = effective_options(raw)[2]
+    return user & (USER_BOOT_SEL | USER_NBOOT1 | USER_NBOOT0) == USER_NBOOT1
+
+
+def rom_option_block(block):
+    """The 16-byte option block with USER selecting ROM through the option
+    bits. Other USER bits are kept; invalid non-RDP pairs are written as their
+    effective FF/00 value, and bytes past the five implemented pairs are kept."""
+    updated = bytearray(block)
+    for index in range(2, 10, 2):
+        if updated[index] ^ updated[index + 1] != 0xFF:
+            updated[index:index + 2] = b"\xff\x00"
+    user = (updated[2] & ~(USER_BOOT_SEL | USER_NBOOT0) | USER_NBOOT1) & 0xFF
+    updated[2], updated[3] = user, user ^ 0xFF
+    return bytes(updated)
+
+
 def production_options(raw):
-    if effective_options(raw)[2] != 0xFF:
-        raise FlashError("Production boot requires the supported USER=FF ROM profile")
+    if effective_options(raw)[2] != ROM_USER:
+        raise FlashError(f"Production boot requires the supported USER=0x{ROM_USER:02X} ROM profile")
     updated = bytearray(effective_options(raw))
-    updated[2] = (updated[2] & ~0x80) | 0x18
-    updated[3] = updated[2] ^ 0xFF
+    updated[2] = APP_USER
+    updated[3] = APP_USER ^ 0xFF
     return bytes(updated)
 
 
@@ -168,6 +193,28 @@ def wait_dfu(tool, timeout, serial=None, path=None, exclude=(), sleep=time.sleep
         sleep(0.1)
 
 
+def select_rom(tool, device, block, uid, timeout, sleep=time.sleep):
+    """Write USER=0x77 through ROM DFU and wait for the adapter to come back
+    on the same USB path with the new options. Returns (device, block)."""
+    target = rom_option_block(block)
+    print("Selecting persistent ROM boot (USER=0x77) before writing flash.")
+    tool.write_options(device, target)
+    deadline = time.monotonic() + timeout
+    problem = "it did not reappear"
+    while time.monotonic() < deadline:
+        sleep(0.2)  # the ROM resets to load the new options
+        try:
+            current = wait_dfu(tool, max(0.1, deadline - time.monotonic()), path=device.path,
+                               sleep=sleep)
+            readback = tool.option_block(current)
+            if readback[:10] == target[:10] and tool.uid(current) == uid:
+                return current, readback
+            problem = "its option bytes read back as " + readback[:10].hex(" ").upper()
+        except FlashError as exc:
+            problem = str(exc)
+    raise FlashError(f"ROM boot selection did not verify ({problem}); no flash was written")
+
+
 def wait_app(ports, uid, timeout, require_disconnect=False, sleep=time.sleep):
     deadline = time.monotonic() + timeout
     disconnected = not require_disconnect
@@ -192,8 +239,10 @@ def require_app_identity(ports, uid, path):
 def app_options(ports, uid, path):
     require_app_identity(ports, uid, path)
     version = ports.command(path, b"v")
-    if not re.fullmatch(rb"v[0-9A-F]{4}", version) or int(version[1:], 16) < 3:
-        raise FlashError("Application handshake requires firmware v0003 or newer")
+    # v0004 is the first firmware whose __dfu selects ROM through the option
+    # bits; with BOOT0 tied low an older image could never be replaced again.
+    if not re.fullmatch(rb"v[0-9A-F]{4}", version) or int(version[1:], 16) < 4:
+        raise FlashError("Application handshake requires firmware v0004 or newer")
     require_app_identity(ports, uid, path)
     reply = ports.command(path, b"__options")
     if not re.fullmatch(rb"OB[0-9A-F]{20}", reply):
@@ -214,9 +263,9 @@ def update(args, image, tool, ports, sleep=time.sleep):
             ack = ports.command(args.device, b"__dfu")
         except CommandRejected as exc:
             raise FlashError("The adapter refused to select ROM boot (__dfu); it is still running "
-                             "the application. ROM selection needs BOOT0 to read high and "
-                             "option bytes the application can rewrite: check the board's "
-                             "BOOT0 connection and read __options.") from exc
+                             "the application. Its option bytes could not be rewritten "
+                             "(read protection level 2 or inconsistent protection prevent it); "
+                             "read __options for details.") from exc
         if ack != b"":
             raise FlashError("Invalid acknowledgement of __dfu")
     device = wait_dfu(tool, args.timeout, args.dfu_serial, args.dfu_path, before, sleep)
@@ -227,7 +276,8 @@ def update(args, image, tool, ports, sleep=time.sleep):
         sleep(0.5)
         device = wait_dfu(tool, args.timeout, path=device.path, sleep=sleep)
     try:
-        options = validate_options(tool.options(device))
+        block = tool.option_block(device)
+        options = validate_options(block[:10])
     except FlashError as exc:
         hint = ("If read protection is enabled, --recover explicitly authorizes destructive "
                 "Read Unprotect.")
@@ -240,9 +290,17 @@ def update(args, image, tool, ports, sleep=time.sleep):
     if requested_uid is not None and uid != requested_uid:
         raise FlashError("ROM DFU UID differs from the requested CDC adapter; no firmware write")
     if args.production:
-        production_options(options)  # Reject unsupported production profiles before writing.
+        # Reject unsupported production profiles before changing anything.
+        production_options(rom_option_block(block)[:10])
     if ports.find(uid):
         raise FlashError("Target UID is present as CDC and DFU; refusing ambiguous identity")
+    if not rom_selected(options):
+        # BOOT0 is tied low: once flash holds an image, a reset only reaches
+        # ROM DFU if the option bits select it. Never write flash without it.
+        device, block = select_rom(tool, device, block, uid, args.timeout, sleep)
+        options = validate_options(block[:10])
+    if not rom_selected(options):
+        raise FlashError("Persistent ROM boot is not selected; no flash was written")
     if tool.uid(device) != uid or tool.options(device) != options:
         raise FlashError("Device identity/options changed during preflight")
     if not args.start:
@@ -259,6 +317,8 @@ def update(args, image, tool, ports, sleep=time.sleep):
     if running_options != options:
         raise FlashError("Running app option readback differs from ROM preflight; no production commit")
     validate_options(running_options)
+    if not rom_selected(running_options):
+        raise FlashError("Running app reports ROM boot is not selected; no production commit")
     if not args.production:
         print(f"Firmware verified and running on {path}; persistent ROM boot remains selected.")
         return
@@ -271,7 +331,7 @@ def update(args, image, tool, ports, sleep=time.sleep):
         actual = app_options(ports, uid, path)
         if actual != expected:
             raise FlashError("Production option readback mismatch")
-        validate_options(actual, require_rom=False)
+        validate_options(actual)
     except (FlashError, OSError, KeyboardInterrupt) as exc:
         raise CommitUnverified("Production commit is unverified/indeterminate: " + str(exc) +
                                ". Reconnect and query __options; if ROM DFU appears, repeat the verified update. "

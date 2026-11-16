@@ -56,29 +56,37 @@ static void test_startup_is_read_only_and_quiesces_rom(void) {
 }
 
 static void test_modes_and_commit_order(void) {
+    /* Factory 0xFF lets the BOOT0 pin decide; tied low, that is flash. ROM is
+     * selected through the option bits alone: BOOT_SEL=0, nBOOT0=0. */
     fill_bank(0xFF);
-    assert(boot_prepare_mode(false)); /* Development stays in ROM on reset. */
-    assert(!boot_sim_erases && !boot_sim_programs);
-    apply(BOOT_SIM_RELOAD);
-    assert(active_user() == 0xFF);
-    assert(boot_prepare_mode(true));
-    assert(active_user() == 0xFF); /* Not committed until ACK drained/reload. */
-    assert(OB->USER == pair(0x7F));
-    assert(boot_sim_programs == 5);
+    assert(boot_prepare_mode(false));
+    assert(OB->USER == pair(0x77));
+    assert(active_user() == 0xFF); /* Not active until ACK drained/reload. */
     const unsigned expected[] = { 0, 2, 3, 4, 1 };
+    assert(boot_sim_erases == 1 && boot_sim_programs == 5);
     for (unsigned i = 0; i < 5; ++i) assert(boot_sim_program_order[i] == expected[i]);
+    apply(BOOT_SIM_RELOAD);
+    assert(active_user() == 0x77);
+    assert(boot_prepare_mode(false));
+    assert(boot_sim_erases == 1); /* Repeated prepare adds no wear. */
+    assert(boot_prepare_mode(true));
+    assert(active_user() == 0x77);
+    assert(OB->USER == pair(0x7F));
+    assert(boot_sim_erases == 2 && boot_sim_programs == 10);
+    for (unsigned i = 0; i < 5; ++i) assert(boot_sim_program_order[5 + i] == expected[i]);
     assert(FLASH->CR & FLASH_CR_LOCK);
     assert(!(FLASH->CR & FLASH_CR_OPTWRE));
     assert(boot_prepare_mode(true));
-    assert(boot_sim_erases == 1); /* Repeated prepare adds no wear. */
+    assert(boot_sim_erases == 2); /* Repeated prepare adds no wear. */
     apply(BOOT_SIM_RELOAD);
     assert(active_user() == 0x7F);
     assert(boot_dfu_available());
-    assert(boot_sim_erases == 1); /* Normal startup does not rewrite modes. */
+    assert(boot_sim_erases == 2); /* Normal startup does not rewrite modes. */
     assert(boot_prepare_mode(false));
     assert(active_user() == 0x7F);
+    assert(OB->USER == pair(0x77));
     apply(BOOT_SIM_RELOAD);
-    assert(active_user() == 0xFF);
+    assert(active_user() == 0x77);
     assert(!boot_sim_main_flash_erased);
 }
 
@@ -92,27 +100,25 @@ static void test_preserve_all_user_bits_and_bank(void) {
         boot_read_options(original);
         assert(boot_dfu_available());
         assert(boot_prepare_mode(false));
-        /* Standard ROM selection is stored erased; an already-equivalent
-         * programmed 0xFF is left alone; other USER bits are kept exactly. */
-        uint16_t rom_user = (user | 0x90u) != 0xFFu ? pair(user | 0x90u)
-                            : user == 0xFFu ? pair(0xFF) : 0xFFFFu;
+        /* ROM through the option bits; the other USER bits are kept. */
+        uint8_t rom_user = (uint8_t)((user | 0x10u) & ~0x88u);
         for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) {
-            assert(boot_sim_get_option(i) == (i == 1 ? rom_user : original[i]));
+            assert(boot_sim_get_option(i) == (i == 1 ? pair(rom_user) : original[i]));
         }
         assert(!boot_sim_main_flash_erased);
         apply(BOOT_SIM_RELOAD);
-        assert(active_user() == (user | 0x90u));
+        assert(active_user() == rom_user);
         assert(FLASH->OBR & FLASH_OBR_RDPRT1);
         assert(!boot_prepare_mode(true)); /* Production commit requires RDP0. */
     }
     fill_bank(0x7F);
     FLASH->CR = FLASH_CR_OPTWRE; /* ROM may leave flash already unlocked. */
     assert(boot_prepare_mode(false));
-    assert(OB->USER == 0xFFFFu);
+    assert(OB->USER == pair(0x77));
 }
 
 static void test_failed_writes_restore_bank(void) {
-    for (unsigned failure = 1; failure <= 4; ++failure) { /* ROM leaves USER erased */
+    for (unsigned failure = 1; failure <= 5; ++failure) {
         for (unsigned corruption = 0; corruption < 2; ++corruption) {
             fill_bank(0x7F);
             uint16_t original[BOOT_OPTION_COUNT];
@@ -163,7 +169,7 @@ static void test_invalid_options_and_rdp_safety(void) {
     assert(OB->WRP0 == pair(0xA4));
     assert(!boot_sim_main_flash_erased);
     apply(BOOT_SIM_RELOAD);
-    assert(active_user() == 0xFF && (FLASH->OBR & FLASH_OBR_RDPRT1));
+    assert(active_user() == 0x77 && (FLASH->OBR & FLASH_OBR_RDPRT1));
 
     boot_sim_init(0x7F, 0xCC);
     assert(!boot_dfu_available() && !boot_prepare_mode(false));
@@ -176,7 +182,7 @@ static void test_invalid_options_and_rdp_safety(void) {
     boot_sim_set_option(0, 0xCC); /* Never activate a stored level-2 byte. */
     assert(!boot_dfu_available() && !boot_prepare_mode(false));
     assert(!boot_sim_erases);
-    boot_sim_init(0x77, 0xAA); /* Unexpected profile cannot commit production. */
+    boot_sim_init(0x75, 0xAA); /* Unexpected profile cannot commit production. */
     assert(!boot_prepare_mode(true));
     boot_sim_init(0xFF, 0xAA);
     boot_sim_set_raw_option(2, 0x1234); /* Bad raw data despite stale good OBR. */
@@ -217,7 +223,7 @@ static void test_unlock_and_reload_failures(void) {
     assert(boot_prepare_mode(false));
     boot_sim_fail_launch = true;
     apply(BOOT_SIM_RESET); /* Fallback reset; raw verified target survives. */
-    assert(active_user() == 0x7F && OB->USER == 0xFFFFu);
+    assert(active_user() == 0x7F && OB->USER == pair(0x77));
     assert(FLASH->CR & FLASH_CR_LOCK);
 }
 
@@ -238,24 +244,29 @@ static uint16_t zero_subset(uint16_t target, unsigned subset) {
 static void test_power_cuts_during_program(void) {
     const unsigned order[] = { 0, 2, 3, 4, 1 };
     for (unsigned flash_boot = 0; flash_boot < 2; ++flash_boot) {
-        for (unsigned position = 0; position < (flash_boot ? 5u : 4u); ++position) {
+        const uint8_t target_user = flash_boot ? 0x7F : 0x77;
+        for (unsigned position = 0; position < 5; ++position) {
             for (unsigned subset = 0; subset < 256; ++subset) {
-                fill_bank(flash_boot ? 0xFF : 0x7F);
+                fill_bank(flash_boot ? 0x77 : 0x7F);
                 unsigned index = order[position];
-                uint16_t target = index == 1 ? pair(flash_boot ? 0x7F : 0xFF)
-                                            : boot_sim_get_option(index);
+                uint16_t target = index == 1 ? pair(target_user) : boot_sim_get_option(index);
                 boot_sim_cut_operation = position + 2; /* Erase is operation 1. */
                 boot_sim_cut_mask = zero_subset(target, subset);
                 cut_prepare(flash_boot);
-                if (active_user() == 0x7F) {
-                    assert(flash_boot && position == 4 && subset == 0);
-                    /* Flash becomes selectable only after every other option
-                     * is restored, and the USER pair is completely written. */
+                if (active_user() == target_user) {
+                    /* The new mode takes effect only after every other option
+                     * is restored and the USER pair is completely written. */
+                    assert(position == 4 && subset == 0);
                     assert(OB->RDP == pair(0xAA));
                     for (unsigned i = 2; i < 5; ++i) {
                         assert(boot_sim_get_option(i) == pair(0xA0 + i));
                     }
-                } else assert(active_user() == 0xFF);
+                } else {
+                    /* Erased or partly written USER loads 0xFF: the BOOT0 pin
+                     * (tied low) then starts the existing application, which
+                     * is still intact and can be asked again. */
+                    assert(active_user() == 0xFF);
+                }
             }
         }
     }
@@ -265,78 +276,64 @@ static void test_power_cuts_during_erase(void) {
         for (unsigned partial = 0; partial < 5; ++partial) {
             for (unsigned erased = 0; erased < 32; ++erased) {
                 for (unsigned subset = 0; subset < 256; ++subset) {
-                    fill_bank(flash_boot ? 0xFF : 0x7F);
+                    fill_bank(flash_boot ? 0x77 : 0x7F);
                     for (unsigned i = 0; i < 5; ++i) {
                         boot_sim_erase_masks[i] = (erased & (1u << i)) ? 0xFFFFu : 0;
                     }
                     boot_sim_erase_masks[partial] = zero_subset(boot_sim_get_option(partial), subset);
                     boot_sim_cut_operation = 1;
                     cut_prepare(flash_boot);
-                    /* Starting from ROM, partial erase never selects flash.
-                     * Starting from flash, the old app remains intact until
-                     * ROM is confirmed, so either original or ROM is safe. */
-                    assert(active_user() == 0xFF || (!flash_boot && active_user() == 0x7F));
+                    /* A partial erase leaves USER as it was or loading
+                     * 0xFF (pin low: the intact application). It never
+                     * produces the other mode. */
+                    assert(active_user() == 0xFF ||
+                           active_user() == (flash_boot ? 0x77 : 0x7F));
                 }
             }
         }
     }
 }
-static void test_rom_selection_requires_boot0_high(void) {
-    fill_bank(0x7F);
-    GPIOF->IDR = 0; /* BOOT0 low: a ROM selection would just reboot the app */
-    assert(!boot_dfu_available());
-    assert(!boot_prepare_mode(false));
-    assert(!boot_sim_erases && !boot_sim_programs && OB->USER == pair(0x7F));
-    assert(FLASH->CR & FLASH_CR_LOCK);
-    assert(boot_prepare_mode(true)); /* flash selection ignores the pin */
-    GPIOF->IDR = 1u << 11;
-    assert(boot_dfu_available());
-    assert(boot_prepare_mode(false));
-    assert(OB->USER == 0xFFFFu);
-}
+/* After an interrupted option erase USER is left erased (loads 0xFF). The
+ * next selection programs that pair in place: no second erase, so RDP is
+ * never exposed again. */
+static void test_erased_user_is_programmed_in_place(void) {
+    for (unsigned flash_boot = 0; flash_boot < 2; ++flash_boot) {
+        const uint8_t target_user = flash_boot ? 0x7F : 0x77;
 
-/* Production -> ROM -> production, as an update does: only the first step
- * erases the bank; the commit programs the erased USER pair in place. */
-static void test_flash_commit_programs_in_place(void) {
-    fill_bank(0x7F);
-    assert(boot_prepare_mode(false));
-    assert(boot_sim_erases == 1 && OB->USER == 0xFFFFu);
-    apply(BOOT_SIM_RELOAD);
-    assert(active_user() == 0xFF);
-
-    unsigned programs = boot_sim_programs;
-    assert(boot_prepare_mode(true));
-    assert(boot_sim_erases == 1);
-    assert(boot_sim_programs == programs + 1 && boot_sim_program_order[programs] == 1);
-    assert(OB->RDP == pair(0xAA) && OB->USER == pair(0x7F));
-    for (unsigned i = 2; i < 5; ++i) assert(boot_sim_get_option(i) == pair(0xA0 + i));
-    assert(FLASH->CR & FLASH_CR_LOCK);
-    assert(!(FLASH->CR & FLASH_CR_OPTWRE));
-    apply(BOOT_SIM_RELOAD);
-    assert(active_user() == 0x7F);
-
-    /* A failed in-place write needs no restore: USER still loads as ROM */
-    fill_bank(0x7F);
-    assert(boot_prepare_mode(false));
-    apply(BOOT_SIM_RELOAD);
-    boot_sim_fail_program = boot_sim_programs + 1;
-    assert(!boot_prepare_mode(true));
-    assert(boot_sim_erases == 1 && OB->USER == 0xFFFFu && OB->RDP == pair(0xAA));
-    assert(FLASH->CR & FLASH_CR_LOCK);
-    boot_sim_load_options();
-    assert(active_user() == 0xFF);
-
-    /* Power lost part-way through the USER write: RDP is never erased, and
-     * anything short of the complete pair still loads as ROM */
-    for (unsigned subset = 0; subset < 256; ++subset) {
         fill_bank(0x7F);
-        assert(boot_prepare_mode(false));
+        boot_sim_set_raw_option(1, 0xFFFFu);
+        boot_sim_load_options();
+        assert(active_user() == 0xFF);
+        assert(boot_prepare_mode(flash_boot));
+        assert(!boot_sim_erases && boot_sim_programs == 1 && boot_sim_program_order[0] == 1);
+        assert(OB->RDP == pair(0xAA) && OB->USER == pair(target_user));
+        for (unsigned i = 2; i < 5; ++i) assert(boot_sim_get_option(i) == pair(0xA0 + i));
+        assert(FLASH->CR & FLASH_CR_LOCK);
+        assert(!(FLASH->CR & FLASH_CR_OPTWRE));
         apply(BOOT_SIM_RELOAD);
-        boot_sim_cut_operation = boot_sim_operations + 1;
-        boot_sim_cut_mask = zero_subset(pair(0x7F), subset);
-        cut_prepare(true);
-        assert(OB->RDP == pair(0xAA) && !(FLASH->OBR & FLASH_OBR_RDPRT1));
-        assert(active_user() == (subset == 0 ? 0x7F : 0xFF));
+        assert(active_user() == target_user);
+
+        /* A failed in-place write needs no restore: USER still loads 0xFF */
+        fill_bank(0x7F);
+        boot_sim_set_raw_option(1, 0xFFFFu);
+        boot_sim_load_options();
+        boot_sim_fail_program = 1;
+        assert(!boot_prepare_mode(flash_boot));
+        assert(!boot_sim_erases && OB->USER == 0xFFFFu && OB->RDP == pair(0xAA));
+        assert(FLASH->CR & FLASH_CR_LOCK);
+
+        /* Power lost part-way through: RDP untouched, and anything short of
+         * the complete pair loads as 0xFF */
+        for (unsigned subset = 0; subset < 256; ++subset) {
+            fill_bank(0x7F);
+            boot_sim_set_raw_option(1, 0xFFFFu);
+            boot_sim_load_options();
+            boot_sim_cut_operation = 1;
+            boot_sim_cut_mask = zero_subset(pair(target_user), subset);
+            cut_prepare(flash_boot);
+            assert(OB->RDP == pair(0xAA) && !(FLASH->OBR & FLASH_OBR_RDPRT1));
+            assert(active_user() == (subset == 0 ? target_user : 0xFF));
+        }
     }
 }
 
@@ -349,8 +346,7 @@ int main(void) {
     test_unlock_and_reload_failures();
     test_power_cuts_during_program();
     test_power_cuts_during_erase();
-    test_rom_selection_requires_boot0_high();
-    test_flash_commit_programs_in_place();
+    test_erased_user_is_programmed_in_place();
     puts("boot: all tests passed");
     return 0;
 }

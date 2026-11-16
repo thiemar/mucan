@@ -170,7 +170,7 @@ static bool frame_is(const can_frame_t *f, uint32_t id, uint8_t flags, uint8_t d
 static void test_info(void) {
     reset_all();
     CHECK(strcmp(exchange("V\r"), "V0001\r") == 0);
-    CHECK(strcmp(exchange("v\r"), "v0003\r") == 0);
+    CHECK(strcmp(exchange("v\r"), "v0004\r") == 0);
     CHECK(strcmp(exchange("N\r"), "NBEEF\r") == 0);
     CHECK(strcmp(exchange("\r"), "\a") == 0);        /* empty line */
     CHECK(strcmp(exchange("Z1\r"), "\a") == 0);      /* timestamps unsupported */
@@ -262,7 +262,7 @@ static void test_line_handling(void) {
 
     reset_all();
     /* CRLF and bare LF are tolerated */
-    CHECK(strcmp(exchange("V\r\nv\r\n"), "V0001\rv0003\r") == 0);
+    CHECK(strcmp(exchange("V\r\nv\r\n"), "V0001\rv0004\r") == 0);
     CHECK(strcmp(exchange("\nN\r"), "NBEEF\r") == 0);
 
     /* Several commands in one USB packet */

@@ -10,7 +10,7 @@
  *   Riiiiiiiil  extended RTR          -> Z
  *   F           status flags, open only -> Fxx
  *   V / v / N   hardware version, software version, serial number
- *   __dfu / __bootrom  select persistent ROM boot and restart
+ *   __dfu / __bootrom  select persistent ROM boot (USER=0x77) and restart
  *   __bootflash       select persistent application boot and restart
  *   __options         read the five raw option/complement pairs
  * Success is CR (or z/Z for transmits), failure is BELL.
@@ -23,7 +23,7 @@
 #define BELL 0x07u
 
 #define HW_VERSION "0001"
-#define SW_VERSION "0003"
+#define SW_VERSION "0004" /* 0004: ROM selected by option bits */
 
 static const uint32_t bitrates[9] = {10000u,  20000u,  50000u,  100000u, 125000u,
                                      250000u, 500000u, 800000u, 1000000u};

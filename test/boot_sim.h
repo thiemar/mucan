@@ -35,7 +35,6 @@ extern FLASH_TypeDef boot_sim_flash;
 extern boot_sim_options_t boot_sim_ob;
 extern DBGMCU_TypeDef boot_sim_dbgmcu;
 extern IWDG_TypeDef boot_sim_iwdg;
-extern GPIO_TypeDef boot_sim_gpiof; /* IDR bit 11 is the BOOT0 pin */
 /* CMSIS core types are excluded above with the ARM intrinsics. */
 typedef struct { uint32_t CTRL, LOAD, VAL; } boot_sim_systick_t;
 typedef struct { uint32_t ICER[1], ICPR[1]; } boot_sim_nvic_t;
@@ -57,14 +56,12 @@ extern bool boot_sim_irq_disabled;
 #undef OB
 #undef DBGMCU
 #undef IWDG
-#undef GPIOF
 #define RCC (&boot_sim_rcc)
 #define SYSCFG (&boot_sim_syscfg)
 #define FLASH (&boot_sim_flash)
 #define OB (&boot_sim_ob)
 #define DBGMCU (&boot_sim_dbgmcu)
 #define IWDG (&boot_sim_iwdg)
-#define GPIOF (&boot_sim_gpiof)
 
 #undef __DSB
 #undef __ISB

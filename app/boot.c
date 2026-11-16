@@ -12,8 +12,9 @@
 #define USER_BOOT_SEL 0x80u
 #define USER_NBOOT1 0x10u
 #define USER_NBOOT0 0x08u
-#define USER_ROM 0xFFu
-#define BOOT0_PIN (1u << 11) /* PF11 doubles as BOOT0 on the STM32F042 */
+#define USER_ROM 0x77u     /* BOOT_SEL=0, nBOOT0=0: ROM bootloader, whatever BOOT0 does */
+#define USER_APP 0x7Fu     /* BOOT_SEL=0, nBOOT0=1: application flash */
+#define USER_FACTORY 0xFFu /* BOOT_SEL=1: the BOOT0 pin decides (tied low: flash) */
 
 #define IWDG_KEY_RELOAD 0xAAAAu
 #define IWDG_KEY_UNLOCK 0x5555u
@@ -89,18 +90,9 @@ static bool option_snapshot(uint16_t image[BOOT_OPTION_COUNT]) {
     return true;
 }
 
-/* With BOOT_SEL set the BOOT0 pin chooses ROM or flash, so selecting ROM only
- * works when the pin is high. Reads the pin through its GPIO input (PF11 is
- * an input after reset and after boot_early()). */
-static bool boot0_high(void) {
-    RCC->AHBENR |= RCC_AHBENR_GPIOFEN;
-    (void)RCC->AHBENR; /* let the clock enable take effect before reading */
-    return (GPIOF->IDR & BOOT0_PIN) != 0u;
-}
-
 bool boot_dfu_available(void) {
     uint16_t image[BOOT_OPTION_COUNT];
-    return boot0_high() && option_snapshot(image);
+    return option_snapshot(image);
 }
 
 static bool options_unlock(void) {
@@ -124,14 +116,6 @@ static bool option_program(unsigned index, uint16_t pair) {
     HAL_StatusTypeDef status = FLASH_WaitForLastOperation(OPTION_TIMEOUT_MS);
     FLASH->CR &= ~FLASH_CR_OPTPG;
     return status == HAL_OK && option_read(index) == pair;
-}
-
-/* The stored pair already loads as `target`. An erased USER pair and a
- * programmed 0xFF/0x00 pair both load as 0xFF. */
-static bool option_matches(unsigned index, uint16_t target) {
-    uint16_t stored = option_read(index);
-    return stored == target ||
-           (index == OPTION_USER && target == 0xFFFFu && stored == option_pair(USER_ROM));
 }
 
 /* Every pair that differs from the target is still erased, so the target can
@@ -189,13 +173,15 @@ static bool options_write(const uint16_t image[BOOT_OPTION_COUNT]) {
 
 bool boot_prepare_mode(bool flash_boot) {
     uint16_t original[BOOT_OPTION_COUNT], updated[BOOT_OPTION_COUNT];
-    if (!flash_boot && !boot_dfu_available()) return false;
     if (!option_snapshot(original)) return false;
+    /* Commit flash only from RDP0 and a known profile: ROM (0x77), already
+     * flash (0x7F), or factory/erased 0xFF. */
     if (flash_boot && ((FLASH->OBR & FLASH_OBR_RDPRT1) ||
                       original[OPTION_RDP] != option_pair(0xAA) ||
-                      (original[OPTION_USER] != option_pair(0xFF) &&
-                       original[OPTION_USER] != 0xFFFFu &&
-                       original[OPTION_USER] != option_pair(0x7F)))) {
+                      (original[OPTION_USER] != option_pair(USER_ROM) &&
+                       original[OPTION_USER] != option_pair(USER_APP) &&
+                       original[OPTION_USER] != option_pair(USER_FACTORY) &&
+                       original[OPTION_USER] != 0xFFFFu))) {
         return false;
     }
     /* OPTERR alone is recoverable: invalid USER/DATA/WRP pairs load as FF.
@@ -204,15 +190,14 @@ bool boot_prepare_mode(bool flash_boot) {
      * FF settings. Invalid/protected RDP is excluded by the checks above. */
     bool unchanged = true;
     for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) updated[i] = original[i];
-    uint8_t user = (uint8_t)original[OPTION_USER] | USER_NBOOT1;
-    user = flash_boot ? (user & ~USER_BOOT_SEL) | USER_NBOOT0 : user | USER_BOOT_SEL;
-    /* Store the standard ROM selection as an erased USER pair. It loads as
-     * 0xFF like the programmed pair, but the later flash commit can then
-     * program USER in place instead of erasing the whole bank, which would
-     * briefly leave RDP erased (= level 1) on the way. */
-    updated[OPTION_USER] = user == USER_ROM ? 0xFFFFu : option_pair(user);
+    /* Both modes select through the option bits (BOOT_SEL=0), so the BOOT0
+     * pin -- tied low on these boards -- never matters. Other USER bits are
+     * kept. */
+    uint8_t user = (uint8_t)((original[OPTION_USER] | USER_NBOOT1) & ~USER_BOOT_SEL);
+    user = flash_boot ? (uint8_t)(user | USER_NBOOT0) : (uint8_t)(user & ~USER_NBOOT0);
+    updated[OPTION_USER] = option_pair(user);
     for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) {
-        if (!option_matches(i, updated[i])) unchanged = false;
+        if (option_read(i) != updated[i]) unchanged = false;
     }
     if (unchanged) return true;
     if (!options_unlock()) return false;
