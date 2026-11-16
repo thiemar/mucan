@@ -55,14 +55,17 @@ class LinkerTests(unittest.TestCase):
         self.assertEqual(symbols["_edata"] - symbols["_sdata"], elf.sections[".data"][5])
         self.assertEqual(symbols["_ebss"] - symbols["_sbss"], elf.sections[".bss"][5])
         self.assertLessEqual(symbols["_edata"], symbols["_sbss"])
-        self.assertLessEqual(symbols["_ebss"], elf.sections[".noinit"][3])
-        self.assertEqual(elf.sections[".noinit"][1], 8)  # SHT_NOBITS: never copied
+        if ".noinit" in elf.sections:
+            self.assertLessEqual(symbols["_ebss"], elf.sections[".noinit"][3])
+            self.assertEqual(elf.sections[".noinit"][1], 8)  # SHT_NOBITS: never copied
         self.assertEqual(symbols["__stack"] % 8, 0)
         text = elf.sections[".text"]
         self.assertEqual(text[3], 0x08000000)
         self.assertEqual(struct.unpack_from("<I", elf.data, text[4])[0], symbols["__stack"])
-        self.assertLessEqual(elf.sections[".noinit"][3] + elf.sections[".noinit"][5],
-                             symbols["__stack"])
+        ram_end = symbols["_ebss"]
+        if ".noinit" in elf.sections:
+            ram_end = elf.sections[".noinit"][3] + elf.sections[".noinit"][5]
+        self.assertLessEqual(ram_end, symbols["__stack"])
         return elf
 
     def test_firmware_layout(self):

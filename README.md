@@ -14,8 +14,10 @@ USB to CAN adapter based on the STM32F042. It appears as a USB serial port
 | `Tiiiiiiiildd…` | Send an extended frame (ID 00000000–1FFFFFFF) | `Z\r` |
 | `riiil` / `Riiiiiiiil` | Send a remote frame | `z\r` / `Z\r` |
 | `F` | Status flags (channel open), as two hex digits | `Fxx\r` |
-| `V` / `v` / `N` | Hardware version, firmware version, serial number | `V0001\r`, `v0002\r`, `Nxxxx\r` |
-| `__dfu` | Restart into the USB DFU bootloader | `\r` |
+| `V` / `v` / `N` | Hardware version, firmware version, serial number | `V0001\r`, `v0003\r`, `Nxxxx\r` |
+| `__dfu` / `__bootrom` | Select persistent ROM DFU boot, then restart | `\r` |
+| `__bootflash` | Select persistent application boot, then restart | `\r` |
+| `__options` | Read the five raw option/complement pairs in address order | `OB` + 20 hex digits + `\r` |
 
 Failures are answered with BELL (`\a`). Received frames are sent in the same
 `t`/`T`/`r`/`R` format, ending in `\r`. Frames are only sent while the channel
@@ -43,8 +45,9 @@ This produces `firmware/app.bin`. To use a toolchain that isn't on your PATH:
 
     make CROSS=/path/to/bin/arm-none-eabi-
 
-`make test` runs the host-side unit tests for USB, CAN, boot-option migration,
-SLCAN and the firmware updater. It needs Python 3 and a host C compiler with
+`make test` runs the host-side unit tests for USB, CAN, explicit boot-option
+changes, inherited clocks, SLCAN, the firmware updater, the ROM DFU protocol
+and the libusb binding. It needs Python 3 and a host C compiler with
 AddressSanitizer support (clang or gcc). The updater tests use fake host tools
 and do not access a USB device.
 
@@ -53,47 +56,111 @@ startup copy/clear boundaries and load addresses. It also links fixtures with
 odd section sizes to check alignment independently of the current code size.
 Use the same `CROSS` setting as for `make`.
 
-### Upgrading firmware
+### USB provisioning and firmware updates
 
-Install [`dfu-util`](http://dfu-util.sourceforge.net), Python 3 and
-`pyserial` (`pip install pyserial`). Attach the adapter, find its serial
-device (`/dev/ttyACM<x>` on Linux, `/dev/tty.usbmodem<x>` on macOS), then:
+This workflow is for the STM32F042C6U6 production board with **PF11/BOOT0
+connected directly to VDD**. Factory options select the ROM USB DFU
+bootloader on power-up. No SWD connection is required. The application never
+programs option bytes during normal startup.
 
-    tools/flashdfu.sh /path/to/device
+The updater implements the required STM32 ROM DFU commands in Python and
+calls **libusb directly through `ctypes`**. It does not require `dfu-util`
+or PyUSB. Install Python 3, [libusb 1.0](https://libusb.info/), and pyserial:
 
-An optional second argument selects another firmware image. Relative paths
-are resolved from your current directory:
+    python3 -m pip install -r tools/requirements.txt
 
-    tools/flashdfu.sh /path/to/device firmware/custom.bin
+On macOS, libusb is available through `brew install libusb`. On Linux, install
+your distribution's libusb 1.0 runtime and grant your account access to the
+DFU USB device. Windows needs a libusb-compatible driver, such as WinUSB,
+for the STM32 DFU interface.
+If library discovery fails, set `LIBUSB_LIBRARY` to the native library's full
+path. Unit tests use simulated USB devices and do not require libusb or pyserial.
 
-This asks the adapter to restart into the STM32's built-in DFU bootloader
-(USB ID `0483:df11`), writes the firmware and starts it. If the adapter is
-already in DFU mode, leave out the device:
+`tools/flashdfu.sh` is a compatibility wrapper for `python3 tools/flashdfu.py`.
+The utility checks the image before
+accessing the board, confirms persistent ROM boot, writes application flash,
+and reads the complete image back for a byte-for-byte comparison. It then
+starts the verified image and reconnects to the same adapter's USB serial
+interface, checking its firmware version and option bytes.
+
+#### Development
+
+With a new board, or one already in ROM DFU:
 
     tools/flashdfu.sh
 
-or run `dfu-util` directly:
+The application starts for this session, but ROM boot remains selected.
+Unplugging and reconnecting the board returns to DFU, including when a
+development image fails to start. A serial handshake failure is reported
+without changing the boot options.
 
-    dfu-util -d 0483:df11 -a 0 -s 0x08000000:leave -D firmware/app.bin
+To start an already-written image, verifying it against the local binary
+without programming it again:
 
-Replugging the adapter while it is in DFU mode returns it to its current
-firmware. If an update fails partway through, re-run the `dfu-util` command
-while the adapter is still in DFU mode. If it can no longer start or reach
-DFU, recover it through an SWD programmer such as an ST-Link.
+    tools/flashdfu.sh --start
 
-On its first boot, this firmware migrates the STM32F042 boot options to
-software-selected flash boot (`BOOT_SEL=0`, `nBOOT0=1`). This permits the
-RAM-flag DFU jump with populated application flash without asserting BOOT0.
-Other option bytes are preserved, and subsequent DFU requests do not rewrite
-them. The physical BOOT0 pin no longer overrides boot selection after this
-migration; use SWD for recovery. Keep power connected during the first boot's
-option migration. If migration fails, `__dfu` returns BELL.
+When the application is running, supply its serial device to request
+persistent ROM boot before updating:
 
-#### Upgrading from older firmware
+    tools/flashdfu.sh /path/to/device
 
-Older firmware entered DFU mode by changing the option bytes, which made the
-adapter boot into the bootloader until they were changed back (the old
-instructions used an `ob.bin` file for that). The `:leave` step above starts
-the new firmware, which migrates the option bytes on its first boot. If an
-adapter stays in DFU mode after being replugged, run the `dfu-util` command
-above.
+An optional second positional argument selects the image. Relative paths
+are resolved from the caller's working directory:
+
+    tools/flashdfu.sh /path/to/device firmware/custom.bin
+
+#### Production
+
+To provision a new board for automatic application startup:
+
+    tools/flashdfu.sh --production
+
+To update a running production board:
+
+    tools/flashdfu.sh --production /path/to/device
+
+Production mode performs the same write, readback and serial reconnection
+as development mode. **Only after those checks pass** does it send
+`__bootflash` to the running application. It then reconnects again and checks
+the committed options. The host utility does not write option-byte images
+through DFU.
+
+For the standard production configuration, the USER byte is `0xFF` for ROM
+boot and `0x7F` for application boot. The application preserves valid
+implemented option pairs and normalizes invalid pairs to their effective
+erased `0xFF` setting. It verifies each write and programs USER last. When
+the stored options already match the requested mode, it skips programming.
+
+#### Interrupted updates and recovery
+
+Before application flash is changed, ROM boot is selected persistently.
+An interrupted transfer therefore leaves the board accessible through ROM
+DFU after reconnecting USB. Retry the appropriate flashing command. The
+updater refuses to write application flash if it cannot establish this
+boot configuration.
+
+An erased or invalid USER option pair is interpreted as `0xFF`, which selects
+ROM with this board's high BOOT0. An interrupted option-bank operation can
+also leave RDP at level 1. Explicit recovery removes that protection and
+**erases the application**, then reflashes and verifies the supplied image:
+
+    tools/flashdfu.sh --recover
+
+Add `--production` to commit application boot after successful recovery and
+serial validation. Never enable RDP level 2; that setting is irreversible
+and disables ROM recovery.
+
+When several DFU devices are connected, select the intended adapter with
+`--dfu-serial SERIAL` or `--dfu-path BUS-PORT`; the utility refuses ambiguous
+selection. Run `tools/flashdfu.sh --help` for all options.
+
+Production firmware must support the boot commands and successfully start
+its USB serial interface. This workflow checks transfer integrity and that
+basic startup path; it does not provide a separate recovery loader for an
+application that later stops accepting commands. Keep experimental firmware
+in development mode.
+
+The option-byte fallback and read-protection behavior are specified in
+[RM0091, sections 2.5, 3.3 and 4](https://www.st.com/resource/en/reference_manual/DM00031936.pdf).
+ROM readback, option programming and Read Unprotect are specified in
+[AN3156](https://www.st.com/resource/en/application_note/an3156-how-to-use-usb-dfu-protocol-in-bootloader-on-stm32-mcus-stmicroelectronics.pdf).

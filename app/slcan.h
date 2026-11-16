@@ -14,7 +14,8 @@
 #include "can_frame.h"
 
 #define SLCAN_MAX_FRAME_LINE 27u  /* "T" + 8 id + 1 dlc + 16 data + CR */
-#define SLCAN_MAX_REPLY 8u        /* longest command reply ("V0001\r") */
+#define SLCAN_OPTION_BYTES 10u    /* five STM32F042 option/complement pairs */
+#define SLCAN_MAX_REPLY 23u       /* "OB" + ten raw bytes as hex + CR */
 #define SLCAN_MAX_COMMAND 31u     /* longest accepted command, excluding CR */
 #define SLCAN_TX_TIMEOUT_MS 100u  /* how long a transmit waits for queue space */
 
@@ -31,6 +32,7 @@ typedef struct {
     bool overflow;     /* discarding an overlong line up to its CR */
     bool tx_pending;   /* a transmit is waiting for queue space */
     bool tx_extended;  /* reply Z rather than z */
+    bool reboot_pending; /* stop consuming commands after a boot-mode request */
     uint32_t tx_since;
     can_frame_t tx_frame;
 } slcan_t;
@@ -43,7 +45,8 @@ void slcan_port_close(void);
 bool slcan_port_transmit(const can_frame_t *frame); /* false: queue full */
 uint8_t slcan_port_status(void);                  /* 'F' flags; clears latched bits */
 uint16_t slcan_port_serial(void);
-bool slcan_port_bootloader(void);                 /* request DFU; false if unavailable */
+bool slcan_port_boot_mode(bool flash_boot);       /* prepare options; false on failure */
+void slcan_port_options(uint8_t bytes[SLCAN_OPTION_BYTES]);
 int slcan_port_getc(void);                        /* -1 if no input */
 uint16_t slcan_port_write_space(void);
 bool slcan_port_write(const uint8_t *data, uint16_t len);

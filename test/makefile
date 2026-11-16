@@ -3,6 +3,7 @@
 #   test_slcan: app/slcan.c against fake CAN and serial hooks
 #   test_can:   app/can.c against a CAN mode-transition model
 #   test_boot:  app/boot.c against flash option-byte and boot models
+#   test_clock: inherited ROM and cold-boot clock configurations
 # Usage: make -C test   (or `make test` from the top level)
 
 HOSTCC ?= cc
@@ -29,12 +30,19 @@ build/test_boot: ../app/boot.c ../app/boot.h boot_sim.c boot_sim.h test_boot.c .
 	@mkdir -p build
 	$(HOSTCC) $(CFLAGS) $(SANITIZE) -DBOOT_SIM -o $@ ../app/boot.c boot_sim.c test_boot.c
 
-run: build/test_usb build/test_slcan build/test_can build/test_boot
+build/test_clock: ../sys/system_stm32f0xx.c ../sys/system_stm32f0xx.h ../sys/stm32f042x6.h ../app/stm32f0xx_hal_conf.h clock_sim.h test_clock.c
+	@mkdir -p $(@D)
+	$(HOSTCC) $(CFLAGS) $(SANITIZE) -I../sys -DSTM32F042x6 -DCLOCK_SIM -o $@ ../sys/system_stm32f0xx.c test_clock.c
+
+run: build/test_usb build/test_slcan build/test_can build/test_boot build/test_clock
 	./build/test_usb
 	./build/test_slcan
 	./build/test_can
 	./build/test_boot
+	./build/test_clock
 	$(PYTHON) test_flashdfu.py
+	$(PYTHON) test_stm32_dfu.py
+	$(PYTHON) test_libusb_transport.py
 
 test-firmware:
 	$(PYTHON) test_linker.py --cross "$(CROSS)" --firmware ../firmware/app.elf

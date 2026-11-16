@@ -10,7 +10,9 @@
  *   Riiiiiiiil  extended RTR          -> Z
  *   F           status flags, open only -> Fxx
  *   V / v / N   hardware version, software version, serial number
- *   __dfu       restart into the DFU bootloader
+ *   __dfu / __bootrom  select persistent ROM boot and restart
+ *   __bootflash       select persistent application boot and restart
+ *   __options         read the five raw option/complement pairs
  * Success is CR (or z/Z for transmits), failure is BELL.
  */
 
@@ -21,7 +23,7 @@
 #define BELL 0x07u
 
 #define HW_VERSION "0001"
-#define SW_VERSION "0002"
+#define SW_VERSION "0003"
 
 static const uint32_t bitrates[9] = {10000u,  20000u,  50000u,  100000u, 125000u,
                                      250000u, 500000u, 800000u, 1000000u};
@@ -138,8 +140,15 @@ static bool transmit_pending(slcan_t *s, uint32_t now_ms) {
     return false;
 }
 
-static bool is_dfu_request(const uint8_t *arg, uint8_t n) {
-    return n == 4u && arg[0] == '_' && arg[1] == 'd' && arg[2] == 'f' && arg[3] == 'u';
+static bool command_matches(const uint8_t *arg, uint8_t n, const char *name) {
+    uint8_t i = 0;
+    while (name[i]) {
+        if (i == n || arg[i] != (uint8_t)name[i]) {
+            return false;
+        }
+        ++i;
+    }
+    return i == n;
 }
 
 static void execute(slcan_t *s, uint32_t now_ms) {
@@ -234,13 +243,30 @@ static void execute(slcan_t *s, uint32_t now_ms) {
             return;
         }
 
-        case '_':
-            if (!is_dfu_request(arg, n)) {
+        case '_': {
+            if (command_matches(arg, n, "_options")) {
+                uint8_t bytes[SLCAN_OPTION_BYTES];
+                slcan_port_options(bytes);
+                out[0] = 'O';
+                out[1] = 'B';
+                for (uint8_t i = 0; i < sizeof(bytes); ++i) {
+                    out[2u + 2u * i] = (uint8_t)hex_digits[bytes[i] >> 4];
+                    out[3u + 2u * i] = (uint8_t)hex_digits[bytes[i] & 0xFu];
+                }
+                out[SLCAN_MAX_REPLY - 1u] = CR;
+                reply(out, SLCAN_MAX_REPLY);
+                return;
+            }
+            bool flash_boot = command_matches(arg, n, "_bootflash");
+            if (!flash_boot && !command_matches(arg, n, "_dfu") &&
+                !command_matches(arg, n, "_bootrom")) {
                 reply_byte(BELL);
                 return;
             }
-            reply_byte(slcan_port_bootloader() ? CR : BELL);
+            s->reboot_pending = slcan_port_boot_mode(flash_boot);
+            reply_byte(s->reboot_pending ? CR : BELL);
             return;
+        }
 
         default:
             /* Including Z (timestamps), M/m (acceptance filter), s (BTR) */
@@ -280,6 +306,7 @@ void slcan_init(slcan_t *s) {
     s->overflow = false;
     s->tx_pending = false;
     s->tx_extended = false;
+    s->reboot_pending = false;
     s->tx_since = 0;
 }
 
@@ -294,6 +321,9 @@ void slcan_service(slcan_t *s, uint32_t now_ms) {
     for (;;) {
         int c;
 
+        if (s->reboot_pending) {
+            return;
+        }
         if (s->tx_pending && !transmit_pending(s, now_ms)) {
             return;
         }

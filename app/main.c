@@ -66,8 +66,7 @@ extern volatile uint32_t _ebss;
 
 static slcan_t slcan;
 static bool clock_synced;
-static bool bootloader_requested;
-static bool dfu_available;
+static bool boot_mode_requested;
 
 void SystemClock_Config(void);
 void __start(void) __attribute__((noreturn));
@@ -105,12 +104,21 @@ uint16_t slcan_port_serial(void) {
     return (uint16_t)(folded ^ (folded >> 16));
 }
 
-bool slcan_port_bootloader(void) {
-    if (!dfu_available) {
+bool slcan_port_boot_mode(bool flash_boot) {
+    if (boot_mode_requested || !boot_prepare_mode(flash_boot)) {
         return false;
     }
-    bootloader_requested = true;
+    boot_mode_requested = true;
     return true;
+}
+
+void slcan_port_options(uint8_t bytes[SLCAN_OPTION_BYTES]) {
+    uint16_t pairs[SLCAN_OPTION_BYTES / 2u];
+    boot_read_options(pairs);
+    for (unsigned i = 0; i < SLCAN_OPTION_BYTES / 2u; ++i) {
+        bytes[2u * i] = (uint8_t)pairs[i];
+        bytes[2u * i + 1u] = (uint8_t)(pairs[i] >> 8);
+    }
 }
 
 int slcan_port_getc(void) {
@@ -149,10 +157,10 @@ static void crs_start(void) {
     HAL_RCCEx_CRSConfig(&crs);
 }
 
-static void __attribute__((noreturn)) enter_bootloader(void) {
+static void __attribute__((noreturn)) apply_boot_mode(void) {
     uint32_t start = HAL_GetTick();
 
-    /* Let the host collect the reply to __dfu, then detach cleanly */
+    /* Let the host collect the boot-command reply, then detach cleanly. */
     while (!usb_cdc_tx_empty() && (uint32_t)(HAL_GetTick() - start) < BOOTLOADER_FLUSH_MS) {
         watchdog_kick();
         usb_poll();
@@ -166,11 +174,11 @@ static void __attribute__((noreturn)) enter_bootloader(void) {
         watchdog_kick();
     }
 
-    boot_enter_bootloader();
+    boot_apply_mode();
 }
 
 void __start(void) {
-    uint32_t reset_flags = boot_early();
+    (void)boot_early();
     const volatile uint32_t *src;
     volatile uint32_t *dest;
     bool session = false;
@@ -184,18 +192,19 @@ void __start(void) {
         *dest++ = 0;
     }
 
-    SystemInit();
+    /* ROM DFU can jump here with clocks already running. Adopt that clock
+     * for HAL's time base before switching to our own configuration. */
+    SystemCoreClockUpdate();
     HAL_Init();
+    __enable_irq();
     SystemClock_Config();
 
-    dfu_available = boot_repair_option_bytes();
-    if (!reset_flags) {
-        /* Entered by a jump (dfu-util :leave), not a reset: restart so that
-         * every peripheral, USB included, starts from its reset state */
-        NVIC_SystemReset();
-    }
-
     watchdog_start();
+
+    /* boot_early() detached ROM USB. Give the host time to observe that
+     * disconnect before announcing the application, without resetting back
+     * to ROM or modifying the persistent boot selection. */
+    HAL_Delay(BOOTLOADER_DETACH_MS);
 
     __GPIOA_CLK_ENABLE();
     usb_init();
@@ -239,16 +248,16 @@ void __start(void) {
 
         slcan_service(&slcan, HAL_GetTick());
 
+        if (boot_mode_requested) {
+            apply_boot_mode();
+        }
+
         /* Received frames go to the host while there's room for a whole line
          * plus a command reply; otherwise they wait in the CAN ring */
         while (usb_cdc_write_space() >= SLCAN_MAX_FRAME_LINE + SLCAN_MAX_REPLY &&
                can_receive(&frame)) {
             uint8_t line[SLCAN_MAX_FRAME_LINE];
             (void)usb_cdc_write(line, slcan_format_frame(&frame, line));
-        }
-
-        if (bootloader_requested) {
-            enter_bootloader();
         }
     }
 }
@@ -264,7 +273,8 @@ void SystemClock_Config(void) {
     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
     HAL_RCC_OscConfig(&RCC_OscInitStruct);
 
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_SYSCLK;
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK |
+                                 RCC_CLOCKTYPE_PCLK1;
     RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI48;
     RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;

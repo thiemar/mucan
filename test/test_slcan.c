@@ -41,7 +41,10 @@ static struct {
     int queue_space;
     uint8_t status;
     bool bootloader;
+    bool flash_boot;
     bool bootloader_unavailable;
+    unsigned option_writes;
+    unsigned option_reads;
 } dev;
 
 static slcan_t s;
@@ -87,12 +90,22 @@ uint16_t slcan_port_serial(void) {
     return 0xBEEF;
 }
 
-bool slcan_port_bootloader(void) {
+bool slcan_port_boot_mode(bool flash_boot) {
     if (dev.bootloader_unavailable) {
         return false;
     }
-    dev.bootloader = true;
+    dev.bootloader = !flash_boot;
+    dev.flash_boot = flash_boot;
+    dev.option_writes++;
     return true;
+}
+
+void slcan_port_options(uint8_t bytes[SLCAN_OPTION_BYTES]) {
+    static const uint8_t options[SLCAN_OPTION_BYTES] = {
+        0xAA, 0x55, 0xFF, 0x00, 0x12, 0xED, 0x34, 0xCB, 0xFF, 0x00
+    };
+    memcpy(bytes, options, sizeof(options));
+    dev.option_reads++;
 }
 
 int slcan_port_getc(void) {
@@ -157,7 +170,7 @@ static bool frame_is(const can_frame_t *f, uint32_t id, uint8_t flags, uint8_t d
 static void test_info(void) {
     reset_all();
     CHECK(strcmp(exchange("V\r"), "V0001\r") == 0);
-    CHECK(strcmp(exchange("v\r"), "v0002\r") == 0);
+    CHECK(strcmp(exchange("v\r"), "v0003\r") == 0);
     CHECK(strcmp(exchange("N\r"), "NBEEF\r") == 0);
     CHECK(strcmp(exchange("\r"), "\a") == 0);        /* empty line */
     CHECK(strcmp(exchange("Z1\r"), "\a") == 0);      /* timestamps unsupported */
@@ -249,7 +262,7 @@ static void test_line_handling(void) {
 
     reset_all();
     /* CRLF and bare LF are tolerated */
-    CHECK(strcmp(exchange("V\r\nv\r\n"), "V0001\rv0002\r") == 0);
+    CHECK(strcmp(exchange("V\r\nv\r\n"), "V0001\rv0003\r") == 0);
     CHECK(strcmp(exchange("\nN\r"), "NBEEF\r") == 0);
 
     /* Several commands in one USB packet */
@@ -321,6 +334,35 @@ static void test_status_and_dfu(void) {
     dev.bootloader_unavailable = false;
     CHECK(strcmp(exchange("__dfu\r"), "\r") == 0);
     CHECK(dev.bootloader);
+}
+
+static void test_boot_options(void) {
+    reset_all();
+    CHECK(strcmp(exchange("__options\r"), "OBAA55FF0012ED34CBFF00\r") == 0);
+    CHECK(dev.option_reads == 1 && dev.option_writes == 0);
+    CHECK(strcmp(exchange("__optionsX\r__bootflashX\r__bootromX\r__dfuX\r"),
+                 "\a\a\a\a") == 0);
+    CHECK(dev.option_writes == 0 && dev.option_reads == 1);
+
+    dev.bootloader_unavailable = true;
+    CHECK(strcmp(exchange("__bootflash\r"), "\a") == 0);
+    CHECK(!s.reboot_pending && !dev.flash_boot && dev.option_writes == 0);
+    dev.bootloader_unavailable = false;
+    CHECK(strcmp(exchange("__bootflash\r__bootrom\r"), "\r") == 0);
+    CHECK(dev.flash_boot && !dev.bootloader && dev.option_writes == 1);
+    CHECK(s.reboot_pending); /* Do not rewrite options twice in one USB packet. */
+
+    reset_all();
+    CHECK(strcmp(exchange("__bootrom\r"), "\r") == 0);
+    CHECK(dev.bootloader && !dev.flash_boot && dev.option_writes == 1);
+
+    reset_all();
+    dev.write_space = SLCAN_MAX_REPLY - 1u;
+    CHECK(strcmp(exchange("__options\r"), "") == 0);
+    CHECK(dev.option_reads == 0); /* Preserve a whole diagnostic reply. */
+    dev.write_space = SLCAN_MAX_REPLY;
+    CHECK(strcmp(exchange(""), "OBAA55FF0012ED34CBFF00\r") == 0);
+    CHECK(dev.option_reads == 1 && dev.option_writes == 0);
 }
 
 static void test_reset(void) {
@@ -416,6 +458,7 @@ int main(void) {
         {"line_handling", test_line_handling},
         {"flow_control", test_flow_control},
         {"status_and_dfu", test_status_and_dfu},
+        {"boot_options", test_boot_options},
         {"reset", test_reset},
         {"format", test_format},
         {"round_trip", test_round_trip},

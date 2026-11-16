@@ -20,8 +20,6 @@ typedef struct {
     volatile uint16_t RDP, USER, DATA0, DATA1, WRP0;
 } boot_sim_options_t;
 typedef enum { HAL_OK, HAL_ERROR } HAL_StatusTypeDef;
-#define OB_BOOT_SEL_SET 0x80u
-#define OB_BOOT0_SET 0x08u
 #define __DBGMCU_CLK_ENABLE() ((void)0)
 
 HAL_StatusTypeDef HAL_FLASH_Unlock(void);
@@ -37,6 +35,20 @@ extern FLASH_TypeDef boot_sim_flash;
 extern boot_sim_options_t boot_sim_ob;
 extern DBGMCU_TypeDef boot_sim_dbgmcu;
 extern IWDG_TypeDef boot_sim_iwdg;
+/* CMSIS core types are excluded above with the ARM intrinsics. */
+typedef struct { uint32_t CTRL, LOAD, VAL; } boot_sim_systick_t;
+typedef struct { uint32_t ICER[1], ICPR[1]; } boot_sim_nvic_t;
+typedef struct { uint32_t ICSR; } boot_sim_scb_t;
+extern boot_sim_systick_t boot_sim_systick;
+extern boot_sim_nvic_t boot_sim_nvic;
+extern boot_sim_scb_t boot_sim_scb;
+extern bool boot_sim_irq_disabled;
+#define SysTick (&boot_sim_systick)
+#define NVIC (&boot_sim_nvic)
+#define SCB (&boot_sim_scb)
+#define SCB_ICSR_PENDSTCLR_Msk (1u << 25)
+#define SCB_ICSR_PENDSVCLR_Msk (1u << 27)
+#define __disable_irq() (boot_sim_irq_disabled = true)
 
 #undef RCC
 #undef SYSCFG
@@ -57,9 +69,13 @@ extern IWDG_TypeDef boot_sim_iwdg;
 #define __ISB() ((void)0)
 #define NVIC_SystemReset boot_sim_reset
 
-enum { BOOT_SIM_RESET = 1, BOOT_SIM_RELOAD, BOOT_SIM_ROM };
+enum { BOOT_SIM_RESET = 1, BOOT_SIM_RELOAD, BOOT_SIM_POWER_CUT };
 extern jmp_buf boot_sim_escape;
 extern unsigned boot_sim_erases, boot_sim_programs, boot_sim_launches;
+extern unsigned boot_sim_program_order[16], boot_sim_operations;
+extern unsigned boot_sim_cut_operation;
+extern uint16_t boot_sim_cut_mask, boot_sim_erase_masks[5];
+extern bool boot_sim_main_flash_erased;
 extern unsigned boot_sim_fail_program, boot_sim_corrupt_program;
 extern bool boot_sim_fail_unlock, boot_sim_fail_option_unlock;
 extern bool boot_sim_fail_erase, boot_sim_fail_launch, boot_sim_fail_persistent;
@@ -67,9 +83,9 @@ extern bool boot_sim_fail_erase, boot_sim_fail_launch, boot_sim_fail_persistent;
 void boot_sim_init(uint8_t user, uint8_t rdp);
 void boot_sim_load_options(void);
 void boot_sim_set_option(unsigned index, uint8_t value);
+void boot_sim_set_raw_option(unsigned index, uint16_t pair);
 uint16_t boot_sim_get_option(unsigned index);
 void boot_sim_program_option(unsigned index, uint8_t value);
 void boot_sim_reset(void) __attribute__((noreturn));
-void boot_sim_jump_to_rom(void) __attribute__((noreturn));
 
 #endif
