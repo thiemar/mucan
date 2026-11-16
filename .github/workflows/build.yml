@@ -21,6 +21,9 @@ jobs:
       - name: Host tests
         run: make test
 
+      - name: Firmware startup layout tests
+        run: make test-firmware
+
       - uses: actions/upload-artifact@v4
         with:
           name: firmware

@@ -67,6 +67,7 @@ extern volatile uint32_t _ebss;
 static slcan_t slcan;
 static bool clock_synced;
 static bool bootloader_requested;
+static bool dfu_available;
 
 void SystemClock_Config(void);
 void __start(void) __attribute__((noreturn));
@@ -104,8 +105,12 @@ uint16_t slcan_port_serial(void) {
     return (uint16_t)(folded ^ (folded >> 16));
 }
 
-void slcan_port_bootloader(void) {
+bool slcan_port_bootloader(void) {
+    if (!dfu_available) {
+        return false;
+    }
     bootloader_requested = true;
+    return true;
 }
 
 int slcan_port_getc(void) {
@@ -183,7 +188,7 @@ void __start(void) {
     HAL_Init();
     SystemClock_Config();
 
-    boot_repair_option_bytes();
+    dfu_available = boot_repair_option_bytes();
     if (!reset_flags) {
         /* Entered by a jump (dfu-util :leave), not a reset: restart so that
          * every peripheral, USB included, starts from its reset state */

@@ -1,8 +1,9 @@
 /*
  * Start-up, DFU bootloader entry and watchdog.
  *
- * DFU entry no longer touches option bytes. The application leaves a magic
- * value in RAM that survives a reset and resets; the very first thing the
+ * After the one-time boot-option migration, DFU entry does not rewrite them.
+ * The application leaves a magic value in RAM that survives a reset and
+ * resets; the very first thing the
  * next boot does is spot it and jump to the ROM bootloader. A power cycle or
  * dfu-util's :leave therefore always returns to the application.
  */
@@ -10,6 +11,7 @@
 #ifndef BOOT_H
 #define BOOT_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
@@ -20,11 +22,18 @@
 uint32_t boot_early(void);
 
 /*
- * Firmware before this change entered DFU by programming the option bytes to
- * boot the ROM bootloader. If a device still has that setting, restore normal
- * boot (resets the device if anything was changed).
+ * One-time STM32F042 migration to BOOT_SEL=0, nBOOT0=1. This is required
+ * for software entry to the ROM even when system memory has been remapped
+ * (AN2606, STM32F04xxx). Preserve the other option bytes and verify writes.
+ * A successful migration reloads the options and resets. Returns true only
+ * if software DFU is already enabled; false means DFU must be rejected.
+ *
+ * This setting disables the physical BOOT0 pin as a boot selector. Recovery
+ * of a damaged application requires SWD; BOOT0 alone cannot recover it.
+ * Run before the application starts its watchdog. Do not cut power during
+ * the one-time option-bank erase/program operation.
  */
-void boot_repair_option_bytes(void);
+bool boot_repair_option_bytes(void);
 
 /* Reset into the ROM DFU bootloader; does not return */
 void boot_enter_bootloader(void) __attribute__((noreturn));

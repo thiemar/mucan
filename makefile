@@ -2,6 +2,7 @@
 #
 #   make                 build firmware/app.bin
 #   make test            run the host-side unit tests (needs a host C compiler)
+#   make test-firmware   build firmware and check its startup memory layout
 #   make clean
 #
 # The arm-none-eabi toolchain must be on PATH, or set CROSS to its prefix,
@@ -38,11 +39,14 @@ all: firmware/$(PROJECT).bin
 test:
 	$(MAKE) -C test
 
+test-firmware: firmware/$(PROJECT).bin
+	$(MAKE) -C test test-firmware CROSS="$(CROSS)"
+
 clean:
 	rm -rf $(BUILD) firmware
 	$(MAKE) -C test clean
 
-.PHONY: all test clean
+.PHONY: all test test-firmware clean
 
 $(BUILD)%.o: %.c
 	@mkdir -p $(@D)

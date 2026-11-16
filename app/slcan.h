@@ -43,7 +43,7 @@ void slcan_port_close(void);
 bool slcan_port_transmit(const can_frame_t *frame); /* false: queue full */
 uint8_t slcan_port_status(void);                  /* 'F' flags; clears latched bits */
 uint16_t slcan_port_serial(void);
-void slcan_port_bootloader(void);                 /* reset into DFU after replying */
+bool slcan_port_bootloader(void);                 /* request DFU; false if unavailable */
 int slcan_port_getc(void);                        /* -1 if no input */
 uint16_t slcan_port_write_space(void);
 bool slcan_port_write(const uint8_t *data, uint16_t len);

@@ -34,7 +34,8 @@ bool can_set_bitrate(uint32_t bitrate);
 /* Join the bus (listen-only never transmits, ACKs or signals errors) */
 bool can_open(bool listen_only);
 
-/* Leave the bus, abort pending transmits and discard queued frames */
+/* Leave the bus, abort pending transmits and discard queued frames. A stuck
+ * controller is reset; if reinitialization fails, open/set-bitrate fail. */
 void can_close(void);
 
 /* Queue a frame; false if closed or the queue is full */

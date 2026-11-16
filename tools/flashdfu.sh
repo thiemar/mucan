@@ -6,10 +6,10 @@
 # With a serial device, the running adapter is first asked to restart into
 # its DFU bootloader. Without one, the adapter must already be in DFU mode.
 
-cd "$(dirname "$0")" || exit 1
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
 
 DEVICE="$1"
-FIRMWARE="${2:-../firmware/app.bin}"
+FIRMWARE="${2:-$SCRIPT_DIR/../firmware/app.bin}"
 DFU_ID="0483:df11"
 
 if [ ! -f "$FIRMWARE" ]; then
@@ -18,7 +18,7 @@ if [ ! -f "$FIRMWARE" ]; then
 fi
 
 if [ -n "$DEVICE" ]; then
-    python3 startdfu.py "$DEVICE" || exit 1
+    python3 "$SCRIPT_DIR/startdfu.py" "$DEVICE" || exit 1
 fi
 
 # Wait up to 10 s for the ROM bootloader to enumerate

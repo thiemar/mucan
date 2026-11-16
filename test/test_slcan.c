@@ -41,6 +41,7 @@ static struct {
     int queue_space;
     uint8_t status;
     bool bootloader;
+    bool bootloader_unavailable;
 } dev;
 
 static slcan_t s;
@@ -86,8 +87,12 @@ uint16_t slcan_port_serial(void) {
     return 0xBEEF;
 }
 
-void slcan_port_bootloader(void) {
+bool slcan_port_bootloader(void) {
+    if (dev.bootloader_unavailable) {
+        return false;
+    }
     dev.bootloader = true;
+    return true;
 }
 
 int slcan_port_getc(void) {
@@ -310,6 +315,10 @@ static void test_status_and_dfu(void) {
     CHECK(strcmp(exchange("_dfu\r"), "\a") == 0);
     CHECK(strcmp(exchange("__xyz\r"), "\a") == 0);
     CHECK(!dev.bootloader);
+    dev.bootloader_unavailable = true;
+    CHECK(strcmp(exchange("__dfu\r"), "\a") == 0);
+    CHECK(!dev.bootloader);
+    dev.bootloader_unavailable = false;
     CHECK(strcmp(exchange("__dfu\r"), "\r") == 0);
     CHECK(dev.bootloader);
 }

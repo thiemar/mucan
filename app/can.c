@@ -1,12 +1,17 @@
 /* bxCAN driver, register level. See can.h. */
 
+#ifdef CAN_SIM
+#include "can_sim.h"
+#else
 #include "stm32f0xx_hal.h"
+#endif
 
 #include "can.h"
 
 #define RX_RING_SIZE 32u   /* frames; power of two */
 #define TX_QUEUE_SIZE 16u  /* frames; power of two */
-#define INIT_TIMEOUT_MS 10u
+/* An extended eight-byte frame can take about 16 ms at 10 kbit/s. */
+#define INIT_TIMEOUT_MS 20u
 
 #if (RX_RING_SIZE & (RX_RING_SIZE - 1u)) || RX_RING_SIZE > 128u
 #error "RX_RING_SIZE must be a power of two no larger than 128"
@@ -41,6 +46,7 @@ static uint8_t tx_tail;
 static uint8_t latched_status; /* events seen by can_poll() since the last read */
 static uint32_t bit_timing;    /* BTR without the mode bits */
 static bool is_open;
+static bool controller_ready;
 
 /* 48 MHz kernel clock. 8 time quanta with the sample point at 87.5%,
  * except 800 kbit/s which needs 15 quanta (86.7%). SJW is 1 quantum. */
@@ -81,10 +87,40 @@ static bool wait_for_init_mode(bool in_init) {
 }
 
 static void release_fifo0(void) {
+#ifdef CAN_SIM
+    can_sim_release_fifo0();
+#else
     CAN->RF0R = CAN_RF0R_RFOM0;
     while (CAN->RF0R & CAN_RF0R_RFOM0) {
         /* Cleared by hardware once the output mailbox is released */
     }
+#endif
+}
+
+static void write_bit_timing(uint32_t btr) {
+#ifdef CAN_SIM
+    can_sim_write_bit_timing(btr);
+#else
+    CAN->BTR = btr;
+#endif
+}
+
+/* A reset stops the controller even if it never acknowledges INRQ. Keep the
+ * selected bitrate in RAM, but discard every frame from the old session. */
+static void reset_peripheral(void) {
+    NVIC_DisableIRQ(CEC_CAN_IRQn);
+#ifdef CAN_SIM
+    can_sim_reset_peripheral();
+#else
+    RCC->APB1RSTR |= RCC_APB1RSTR_CANRST;
+    RCC->APB1RSTR &= ~RCC_APB1RSTR_CANRST;
+#endif
+    NVIC_ClearPendingIRQ(CEC_CAN_IRQn);
+    is_open = false;
+    controller_ready = false;
+    tx_head = tx_tail = 0;
+    rx_head = rx_tail = 0;
+    rx_status = latched_status = 0;
 }
 
 static void read_fifo0(can_frame_t *frame) {
@@ -172,6 +208,43 @@ static void load_mailbox(uint32_t mailbox, const can_frame_t *frame) {
     box->TIR = tir | CAN_TI0R_TXRQ;
 }
 
+/* Called only with the channel closed. A failed initialization leaves the
+ * peripheral reset, with interrupts disabled and no permission to reopen. */
+static bool configure_controller(void) {
+    /* Leave sleep and enter initialisation mode */
+    CAN->MCR = (CAN->MCR & ~CAN_MCR_SLEEP) | CAN_MCR_INRQ;
+    if (!wait_for_init_mode(true)) {
+        reset_peripheral();
+        return false;
+    }
+
+    /* Automatic bus-off recovery; transmit in request order; automatic
+     * retransmission on; overwrite on FIFO overrun (the ISR keeps up) */
+    CAN->MCR = (CAN->MCR & ~(CAN_MCR_TTCM | CAN_MCR_AWUM | CAN_MCR_NART | CAN_MCR_RFLM)) |
+               CAN_MCR_ABOM | CAN_MCR_TXFP;
+
+    write_bit_timing(bit_timing);
+
+    /* Filter 0: 32-bit mask mode with an all-zero mask accepts everything
+     * into FIFO 0 */
+    CAN->FMR |= CAN_FMR_FINIT;
+    CAN->FA1R &= ~1u;
+    CAN->FM1R &= ~1u;
+    CAN->FS1R |= 1u;
+    CAN->FFA1R &= ~1u;
+    CAN->sFilterRegister[0].FR1 = 0;
+    CAN->sFilterRegister[0].FR2 = 0;
+    CAN->FA1R |= 1u;
+    CAN->FMR &= ~CAN_FMR_FINIT;
+
+    CAN->IER = CAN_IER_FMPIE0 | CAN_IER_FOVIE0;
+    NVIC_SetPriority(CEC_CAN_IRQn, 1);
+    NVIC_EnableIRQ(CEC_CAN_IRQn);
+
+    controller_ready = true;
+    return true;
+}
+
 void can_init(void) {
     GPIO_InitTypeDef gpio;
 
@@ -194,50 +267,26 @@ void can_init(void) {
     gpio.Alternate = GPIO_AF4_CAN;
     HAL_GPIO_Init(GPIOB, &gpio);
 
-    /* Leave sleep and enter initialisation mode */
-    CAN->MCR = (CAN->MCR & ~CAN_MCR_SLEEP) | CAN_MCR_INRQ;
-    (void)wait_for_init_mode(true);
-
-    /* Automatic bus-off recovery; transmit in request order; automatic
-     * retransmission on; overwrite on FIFO overrun (the ISR keeps up) */
-    CAN->MCR = (CAN->MCR & ~(CAN_MCR_TTCM | CAN_MCR_AWUM | CAN_MCR_NART | CAN_MCR_RFLM)) |
-               CAN_MCR_ABOM | CAN_MCR_TXFP;
-
     (void)bit_timing_for(1000000u, &bit_timing);
-    CAN->BTR = bit_timing;
-
-    /* Filter 0: 32-bit mask mode with an all-zero mask accepts everything
-     * into FIFO 0 */
-    CAN->FMR |= CAN_FMR_FINIT;
-    CAN->FA1R &= ~1u;
-    CAN->FM1R &= ~1u;
-    CAN->FS1R |= 1u;
-    CAN->FFA1R &= ~1u;
-    CAN->sFilterRegister[0].FR1 = 0;
-    CAN->sFilterRegister[0].FR2 = 0;
-    CAN->FA1R |= 1u;
-    CAN->FMR &= ~CAN_FMR_FINIT;
-
-    CAN->IER = CAN_IER_FMPIE0 | CAN_IER_FOVIE0;
-    NVIC_SetPriority(CEC_CAN_IRQn, 1);
-    NVIC_EnableIRQ(CEC_CAN_IRQn);
-
+    reset_peripheral();
+    (void)configure_controller();
     is_open = false;
 }
 
 bool can_set_bitrate(uint32_t bitrate) {
     uint32_t btr;
 
-    if (is_open || !bit_timing_for(bitrate, &btr)) {
+    if (is_open || !controller_ready || !(CAN->MSR & CAN_MSR_INAK) ||
+        !bit_timing_for(bitrate, &btr)) {
         return false;
     }
     bit_timing = btr;
-    CAN->BTR = bit_timing; /* only writable in initialisation mode */
+    write_bit_timing(bit_timing);
     return true;
 }
 
 bool can_open(bool listen_only) {
-    if (is_open) {
+    if (is_open || !controller_ready || !(CAN->MSR & CAN_MSR_INAK)) {
         return false;
     }
 
@@ -246,7 +295,7 @@ bool can_open(bool listen_only) {
     latched_status = 0;
     CAN->TSR = TSR_RQCP; /* forget completions from aborts in can_close() */
 
-    CAN->BTR = bit_timing | (listen_only ? CAN_BTR_SILM : 0u);
+    write_bit_timing(bit_timing | (listen_only ? CAN_BTR_SILM : 0u));
     CAN->ESR = CAN_ESR_LEC; /* LEC = 7 until the first new error */
 
     /* The controller joins once it sees 11 recessive bits; no need to wait */
@@ -261,7 +310,14 @@ void can_close(void) {
     }
 
     CAN->MCR |= CAN_MCR_INRQ;
-    (void)wait_for_init_mode(true);
+    if (!wait_for_init_mode(true)) {
+        /* Closing a USB session must still stop CAN if the controller is
+         * stuck. Reset cancels every mailbox; reinitialize at the same rate.
+         * If recovery fails, open/set-bitrate reject further commands. */
+        reset_peripheral();
+        (void)configure_controller();
+        return;
+    }
 
     /* Pending mailboxes would otherwise go out when the channel reopens */
     CAN->TSR = TSR_ABRQ;

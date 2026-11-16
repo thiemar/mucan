@@ -239,8 +239,7 @@ static void execute(slcan_t *s, uint32_t now_ms) {
                 reply_byte(BELL);
                 return;
             }
-            reply_byte(CR);
-            slcan_port_bootloader();
+            reply_byte(slcan_port_bootloader() ? CR : BELL);
             return;
 
         default:

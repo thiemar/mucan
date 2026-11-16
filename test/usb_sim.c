@@ -39,6 +39,7 @@ static uint16_t pma[PMA_BYTES / 2u];
 static uint16_t istr_events;
 static uint8_t daddr;
 static bool connected;
+static uint32_t irq_mask;
 static uint8_t host_in_toggle[8];
 static uint8_t host_out_toggle[8];
 static int errors;
@@ -137,6 +138,17 @@ void hw_start(void) {
     istr_events = 0;
     daddr = 0;
     connected = false;
+    irq_mask = 0;
+}
+
+uint32_t hw_irq_save(void) {
+    uint32_t old = irq_mask;
+    irq_mask = 1;
+    return old;
+}
+
+void hw_irq_restore(uint32_t mask) {
+    irq_mask = mask;
 }
 
 void hw_connect(void) {
@@ -360,6 +372,10 @@ bool sim_connected(void) {
 
 uint8_t sim_daddr(void) {
     return daddr;
+}
+
+bool sim_irq_masked(void) {
+    return irq_mask != 0;
 }
 
 int sim_take_errors(void) {

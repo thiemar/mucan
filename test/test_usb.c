@@ -478,6 +478,122 @@ static void test_halt(void) {
     CHECK_MODEL();
 }
 
+static void check_disable_retry_mask(void) {
+    CHECK(sim_irq_masked());
+}
+
+static void bulk_in_during_disable(void) {
+    uint8_t buf[64];
+    uint16_t n;
+
+    /* The status toggle/readback must not be interrupted by the CAN ISR. */
+    CHECK(sim_irq_masked());
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 3);
+    CHECK(memcmp(buf, "abc", 3) == 0);
+    sim_before_next_write(1, check_disable_retry_mask);
+}
+
+static void test_halt_pending_packets(void) {
+    uint8_t data[130], buf[160];
+    uint16_t n;
+    int sizes[8], count;
+    const uint16_t lengths[] = {3, 64, 130};
+
+    for (size_t i = 0; i < sizeof(data); i++) {
+        data[i] = (uint8_t)i;
+    }
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+        enumerate();
+        CHECK(usb_cdc_write(data, lengths[i]));
+        /* Halt after the first packet has entered PMA, before its host IN. */
+        CHECK(control(0x02, 3, 0, 0x81, 0, NULL) == 0);
+        CHECK(sim_in(address, 1, buf, &n) == SIM_STALL);
+        CHECK(control(0x02, 1, 0, 0x81, 0, NULL) == 0);
+        sim_reset_host_toggle(0x81);
+        CHECK(bulk_read(buf, sizeof(buf), sizes, &count) == lengths[i]);
+        CHECK(memcmp(buf, data, lengths[i]) == 0);
+        CHECK(usb_cdc_tx_empty());
+        CHECK(!sim_irq_masked());
+        CHECK_MODEL();
+    }
+
+    enumerate();
+    CHECK(usb_cdc_write((const uint8_t *)"abc", 3));
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 3);
+    /* EP0 is serviced before this bulk completion; clearing halt must not
+     * replay a packet the host already acknowledged. */
+    CHECK(control(0x02, 1, 0, 0x81, 0, NULL) == 0);
+    sim_reset_host_toggle(0x81);
+    CHECK(sim_in(address, 1, buf, &n) == SIM_NAK);
+    CHECK(usb_cdc_tx_empty());
+
+    /* Completion can also arrive during the first endpoint status write. */
+    CHECK(usb_cdc_write((const uint8_t *)"abc", 3));
+    sim_before_next_write(1, bulk_in_during_disable);
+    CHECK(control(0x02, 1, 0, 0x81, 0, NULL) == 0);
+    sim_reset_host_toggle(0x81);
+    CHECK(sim_in(address, 1, buf, &n) == SIM_NAK);
+    CHECK(usb_cdc_tx_empty());
+
+    /* Clearing a full packet's completion still owes its terminating ZLP. */
+    CHECK(usb_cdc_write(data, 64));
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 64);
+    CHECK(control(0x02, 1, 0, 0x81, 0, NULL) == 0);
+    sim_reset_host_toggle(0x81);
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 0);
+    usb_poll();
+    CHECK(usb_cdc_tx_empty());
+
+    /* The same control priority must not erase an acknowledged OUT packet. */
+    CHECK(sim_out(address, 2, (const uint8_t *)"O\r", 2) == SIM_ACK);
+    CHECK(control(0x02, 1, 0, 0x02, 0, NULL) == 0);
+    sim_reset_host_toggle(0x02);
+    CHECK(usb_cdc_getc() == 'O' && usb_cdc_getc() == '\r');
+    CHECK(usb_cdc_getc() == -1);
+    CHECK(!sim_irq_masked());
+    CHECK_MODEL();
+}
+
+static void test_set_interface_resets_endpoints(void) {
+    uint8_t buf[64];
+    uint16_t n;
+
+    enumerate();
+    CHECK(sim_out(address, 2, (const uint8_t *)"x", 1) == SIM_ACK);
+    usb_poll();
+    CHECK(usb_cdc_getc() == 'x');
+    CHECK(usb_cdc_write((const uint8_t *)"y", 1));
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 1);
+    usb_poll();
+
+    /* Both bulk toggles are now DATA1. Selecting alt 0 again resets them. */
+    CHECK(control(0x01, 11, 0, 1, 0, NULL) == 0);
+    sim_reset_host_toggle(0x02);
+    sim_reset_host_toggle(0x81);
+    CHECK(sim_out(address, 2, (const uint8_t *)"O\r", 2) == SIM_ACK);
+    usb_poll();
+    CHECK(usb_cdc_getc() == 'O' && usb_cdc_getc() == '\r');
+    CHECK(usb_cdc_write((const uint8_t *)"z\r", 2));
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 2);
+    CHECK(memcmp(buf, "z\r", 2) == 0);
+    usb_poll();
+
+    CHECK(control(0x02, 3, 0, 0x81, 0, NULL) == 0);
+    CHECK(control(0x02, 3, 0, 0x02, 0, NULL) == 0);
+    CHECK(control(0x02, 3, 0, 0x83, 0, NULL) == 0);
+    CHECK(control(0x01, 11, 0, 0, 0, NULL) == 0);
+    CHECK(control(0x82, 0, 0, 0x83, 2, buf) == 2 && buf[0] == 0);
+    CHECK(control(0x82, 0, 0, 0x81, 2, buf) == 2 && buf[0] == 1);
+    CHECK(control(0x82, 0, 0, 0x02, 2, buf) == 2 && buf[0] == 1);
+    CHECK(control(0x01, 11, 0, 1, 0, NULL) == 0);
+    sim_reset_host_toggle(0x02);
+    sim_reset_host_toggle(0x81);
+    CHECK(control(0x82, 0, 0, 0x81, 2, buf) == 2 && buf[0] == 0);
+    CHECK(control(0x82, 0, 0, 0x02, 2, buf) == 2 && buf[0] == 0);
+    CHECK(!sim_irq_masked());
+    CHECK_MODEL();
+}
+
 static void test_reset_and_reconfigure(void) {
     uint8_t buf[64];
 
@@ -585,6 +701,119 @@ static void test_ctr_race(void) {
     }
 }
 
+static const uint8_t abort_setup[8] = {0x80, 6, 0, 1, 0, 0, 18, 0};
+static int setup_write_count;
+static bool setup_accepted, setup_reply_seen;
+
+/* Try the new request's IN at each register write while SETUP is handled.
+ * Any accepted packet must belong to the new request, never the old tail. */
+static void probe_setup_reply(void) {
+    uint8_t buf[64];
+    uint16_t n;
+    sim_handshake_t h = sim_in(address, 0, buf, &n);
+
+    CHECK(h == SIM_NAK || h == SIM_TIMEOUT || h == SIM_ACK);
+    if (h == SIM_ACK) {
+        CHECK(n == 18 && buf[0] == 18 && buf[1] == 1);
+        setup_reply_seen = true;
+    } else {
+        sim_before_next_write(0, probe_setup_reply);
+    }
+}
+
+static void probe_setup_during_disable_retry(void) {
+    CHECK(sim_irq_masked());
+    probe_setup_reply();
+}
+
+static void abort_setup_at_write(void) {
+    sim_handshake_t h;
+
+    if (--setup_write_count) {
+        sim_before_next_write(0, abort_setup_at_write);
+        return;
+    }
+    h = sim_setup(address, abort_setup);
+    CHECK(h == SIM_ACK || h == SIM_TIMEOUT);
+    setup_accepted = h == SIM_ACK;
+    if (setup_accepted) {
+        /* A SETUP during VALID-to-DISABLED can require a second write. */
+        CHECK(sim_irq_masked());
+        sim_before_next_write(0, probe_setup_during_disable_retry);
+    }
+}
+
+static void test_setup_aborts_pending_in(void) {
+    const uint8_t config_setup[8] = {0x80, 6, 0, 2, 0, 0, 67, 0};
+    uint8_t buf[64];
+    uint16_t n;
+
+    /* Already pending, or arriving at each of the four register writes
+     * between an IN completion and arming the next descriptor packet. */
+    for (int write = 0; write <= 4; write++) {
+        enumerate();
+        CHECK(sim_setup(address, config_setup) == SIM_ACK);
+        usb_poll();
+        CHECK(sim_in(address, 0, buf, &n) == SIM_ACK && n == 64);
+        setup_accepted = setup_reply_seen = false;
+        if (!write) {
+            CHECK(sim_setup(address, abort_setup) == SIM_ACK);
+            setup_accepted = true;
+            sim_before_next_write(0, probe_setup_reply);
+        } else {
+            setup_write_count = write;
+            sim_before_next_write(0, abort_setup_at_write);
+        }
+        usb_poll();
+        sim_before_next_write(0, NULL);
+        if (!setup_accepted) {
+            /* SETUP during the disabled interval is retried by the host. */
+            CHECK(sim_setup(address, abort_setup) == SIM_ACK);
+            usb_poll();
+        }
+        if (!setup_reply_seen) {
+            CHECK(sim_in(address, 0, buf, &n) == SIM_ACK && n == 18);
+            CHECK(buf[0] == 18 && buf[1] == 1);
+        }
+        CHECK(sim_out(address, 0, NULL, 0) == SIM_ACK);
+        usb_poll();
+        CHECK(!sim_irq_masked());
+        CHECK_MODEL();
+    }
+
+    /* Preserve the caller's interrupt mask, including an already masked
+     * caller, rather than enabling interrupts unconditionally. */
+    (void)hw_irq_save();
+    CHECK(get_descriptor(1, 0, 18, buf) == 18);
+    CHECK(sim_irq_masked());
+    hw_irq_restore(0);
+    CHECK_MODEL();
+}
+
+static void test_address_status_before_setup(void) {
+    const uint8_t set_address[8] = {0, 5, 9, 0, 0, 0, 0, 0};
+    uint8_t buf[64];
+    uint16_t n;
+
+    usb_init();
+    sim_bus_reset();
+    usb_poll();
+    address = 0;
+    CHECK(sim_setup(address, set_address) == SIM_ACK);
+    usb_poll();
+    CHECK(sim_in(address, 0, buf, &n) == SIM_ACK && n == 0);
+    CHECK(sim_setup(address, abort_setup) == SIM_ACK);
+    usb_poll();
+    CHECK(sim_daddr() == (0x80 | 9));
+    address = 9;
+    CHECK(sim_in(address, 0, buf, &n) == SIM_ACK && n == 18);
+    CHECK(buf[0] == 18 && buf[1] == 1);
+    CHECK(sim_out(address, 0, NULL, 0) == SIM_ACK);
+    usb_poll();
+    CHECK(!sim_irq_masked());
+    CHECK_MODEL();
+}
+
 int main(void) {
     struct {
         const char *name;
@@ -598,9 +827,13 @@ int main(void) {
         {"bulk_in_zlp", test_bulk_in_zlp},
         {"bulk_in_ring", test_bulk_in_ring},
         {"halt", test_halt},
+        {"halt_pending_packets", test_halt_pending_packets},
+        {"set_interface_resets", test_set_interface_resets_endpoints},
         {"reset_and_reconfigure", test_reset_and_reconfigure},
         {"tx_empty_and_disconnect", test_tx_empty_and_disconnect},
         {"ctr_race", test_ctr_race},
+        {"setup_aborts_pending_in", test_setup_aborts_pending_in},
+        {"address_status_setup", test_address_status_before_setup},
     };
 
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

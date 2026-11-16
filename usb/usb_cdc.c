@@ -103,6 +103,16 @@
 /* 96-bit unique device ID (RM0091, "Device electronic signature") */
 #define HW_UID ((const uint8_t *)0x1FFFF7ACu)
 
+static inline uint32_t hw_irq_save(void) {
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    return mask;
+}
+
+static inline void hw_irq_restore(uint32_t mask) {
+    __set_PRIMASK(mask);
+}
+
 static inline uint16_t hw_epr_get(uint8_t ep) {
     return (&USB->EP0R)[2u * ep];
 }
@@ -359,6 +369,31 @@ static void ep_set_tx_status(uint8_t ep, uint16_t tx) {
     hw_epr_set(ep, (uint16_t)((r & EPR_RW) | EPR_CTR | ((r ^ tx) & EPR_STAT_TX)));
 }
 
+/* Stop transactions before changing a transfer's state. A transaction may
+ * finish between the status read and toggle write: VALID then becomes NAK,
+ * so the first write produces STALL rather than DISABLED. Read back and
+ * finish disabling it before inspecting CTR flags or touching its buffer.
+ * Keep this short register sequence uninterruptible: at 48 MHz the retry
+ * finishes before the next full-speed token, so a CAN ISR cannot expose the
+ * transient STALL to the host. SETUP can replace STALL, but only once because
+ * CTR_RX then protects the received packet. */
+static void ep_disable(uint8_t ep, uint16_t status_mask) {
+    uint32_t mask = hw_irq_save();
+    uint16_t r;
+    while (((r = hw_epr_get(ep)) & status_mask) != 0u) {
+        hw_epr_set(ep, (uint16_t)((r & (EPR_RW | status_mask)) | EPR_CTR));
+    }
+    hw_irq_restore(mask);
+}
+
+static void ep_disable_rx(uint8_t ep) {
+    ep_disable(ep, EPR_STAT_RX);
+}
+
+static void ep_disable_tx(uint8_t ep) {
+    ep_disable(ep, EPR_STAT_TX);
+}
+
 static void ep_clear_ctr_rx(uint8_t ep) {
     hw_epr_set(ep, (uint16_t)((hw_epr_get(ep) & EPR_RW) | EPR_CTR_TX));
 }
@@ -490,18 +525,32 @@ static bool ep_set_halt(uint16_t address, bool halt) {
 
     switch (address) {
         case EP_IN_ADDR:
+            ep_disable_tx(EP_IN);
+            /* EP0 has higher priority than the bulk completion: a packet
+             * may already have reached the host but still have CTR_TX set. */
+            if (hw_epr_get(EP_IN) & EPR_CTR_TX) {
+                ep_clear_ctr_tx(EP_IN);
+                tx_busy = 0;
+            }
             if (halt) {
                 halted |= (uint8_t)(1u << EP_IN);
                 ep_set_tx_status(EP_IN, TX_STALL);
             } else {
                 halted &= (uint8_t)~(1u << EP_IN);
-                ep_configure(EP_IN, EPR_TYPE_BULK, RX_DIS, TX_NAK);
-                tx_busy = 0;
+                /* tx_tail already advanced when this packet entered PMA.
+                 * Keep an unacknowledged packet armed after resetting DATA0. */
+                ep_configure(EP_IN, EPR_TYPE_BULK, RX_DIS, tx_busy ? TX_VALID : TX_NAK);
             }
             return true;
         case EP_OUT_ADDR:
+            ep_disable_rx(EP_OUT);
+            /* Preserve an OUT packet acknowledged before this request,
+             * including one whose completion usb_poll has not seen yet. */
+            halted |= (uint8_t)(1u << EP_OUT);
+            if (hw_epr_get(EP_OUT) & EPR_CTR_RX) {
+                cdc_out_received();
+            }
             if (halt) {
-                halted |= (uint8_t)(1u << EP_OUT);
                 ep_set_rx_status(EP_OUT, RX_STALL);
             } else {
                 halted &= (uint8_t)~(1u << EP_OUT);
@@ -735,6 +784,14 @@ static bool standard_request(void) {
                 req->wValue != 0u) {
                 return false;
             }
+            /* Even selecting the current alternate setting resets its
+             * endpoint halts and DATA toggles (USB 2.0, 9.1.1.5/9.4.5). */
+            if (req->wIndex == 0u) {
+                (void)ep_set_halt(EP_NOTIFY_ADDR, false);
+            } else {
+                (void)ep_set_halt(EP_IN_ADDR, false);
+                (void)ep_set_halt(EP_OUT_ADDR, false);
+            }
             ctrl_ack();
             return true;
 
@@ -864,13 +921,19 @@ static void ctrl_out_received(void) {
     }
 }
 
-static void ctrl_in_sent(void) {
+static void ctrl_in_sent(bool pending_rx) {
     ep_clear_ctr_tx(EP_CTRL);
 
     switch (ctrl.state) {
         case CTRL_DATA_IN:
+            /* A new SETUP aborts this data stage; a status OUT ends it.
+             * Never arm another old packet before handling either one. */
+            if (pending_rx) {
+                break;
+            }
             if (ctrl.in_left || ctrl.in_zlp) {
                 ctrl_in_packet();
+                return;
             } else {
                 ctrl.state = CTRL_STATUS_OUT;
             }
@@ -884,6 +947,10 @@ static void ctrl_in_sent(void) {
             break;
         default:
             break;
+    }
+
+    if (!pending_rx) {
+        ep_set_status(EP_CTRL, RX_VALID, TX_NAK);
     }
 }
 
@@ -954,9 +1021,18 @@ void usb_poll(void) {
 
         switch (ep) {
             case EP_CTRL:
-                /* Finish the previous IN before a SETUP starts a new transfer */
+                /* Freeze both directions before clearing CTR or preparing a
+                 * reply. A SETUP arriving before RX is disabled is caught by
+                 * the refreshed flags below; during this short window the
+                 * host retries it. Re-enabling RX and the reply together lets
+                 * hardware cancel that reply if another SETUP arrives later. */
+                ep_disable_rx(EP_CTRL);
+                ep_disable_tx(EP_CTRL);
+                epr = hw_epr_get(EP_CTRL);
                 if (epr & EPR_CTR_TX) {
-                    ctrl_in_sent();
+                    /* A completed SET_ADDRESS status still takes effect,
+                     * even when the next SETUP is already pending. */
+                    ctrl_in_sent((epr & EPR_CTR_RX) != 0);
                 }
                 if (epr & EPR_CTR_RX) {
                     if (epr & EPR_SETUP) {

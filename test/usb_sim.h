@@ -25,6 +25,8 @@ void hw_set_address(uint8_t address);
 void hw_start(void);
 void hw_connect(void);
 void hw_disconnect(void);
+uint32_t hw_irq_save(void);
+void hw_irq_restore(uint32_t mask);
 
 extern const uint8_t sim_uid[12];
 #define HW_UID sim_uid
@@ -47,6 +49,7 @@ void sim_before_next_write(uint8_t ep, void (*fn)(void));
 
 bool sim_connected(void);
 uint8_t sim_daddr(void);
+bool sim_irq_masked(void);
 
 /* Protocol violations detected by the model since the last call */
 int sim_take_errors(void);
