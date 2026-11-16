@@ -96,7 +96,10 @@ static int control(uint8_t type, uint8_t request, uint16_t value, uint16_t index
     }
 
     while (done < length) {
-        n = (uint16_t)((length - done) < 64u ? (length - done) : 64u);
+        n = (uint16_t)(length - done);
+        if (n > 64u) {
+            n = 64u;
+        }
         h = out_token(0, data + done, n);
         if (h == SIM_STALL) {
             return STALLED;
