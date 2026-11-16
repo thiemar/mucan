@@ -48,6 +48,7 @@
 
 #include "boot.h"
 #include "can.h"
+#include "clock.h"
 #include "slcan.h"
 #include "usb_cdc.h"
 
@@ -68,7 +69,6 @@ static slcan_t slcan;
 static bool clock_synced;
 static bool boot_mode_requested;
 
-void SystemClock_Config(void);
 void __start(void) __attribute__((noreturn));
 
 void HAL_MspInit(void) {
@@ -178,11 +178,12 @@ static void __attribute__((noreturn)) apply_boot_mode(void) {
 }
 
 void __start(void) {
-    (void)boot_early();
     const volatile uint32_t *src;
     volatile uint32_t *dest;
     bool session = false;
     bool dtr = false;
+
+    boot_early();
 
     /* Set up .data and .bss */
     for (src = &_eronly, dest = &_sdata; dest < &_edata;) {
@@ -192,12 +193,13 @@ void __start(void) {
         *dest++ = 0;
     }
 
-    /* ROM DFU can jump here with clocks already running. Adopt that clock
-     * for HAL's time base before switching to our own configuration. */
+    /* HAL's tick starts from whatever clock is running (HSI after reset, or
+     * HSI48 if the ROM bootloader started us); clock_init() then switches to
+     * HSI48 and retunes the tick for it. */
     SystemCoreClockUpdate();
     HAL_Init();
     __enable_irq();
-    SystemClock_Config();
+    clock_init();
 
     watchdog_start();
 
@@ -262,30 +264,6 @@ void __start(void) {
     }
 }
 
-
-void SystemClock_Config(void) {
-    RCC_OscInitTypeDef RCC_OscInitStruct;
-    RCC_ClkInitTypeDef RCC_ClkInitStruct;
-    RCC_PeriphCLKInitTypeDef PeriphClkInit;
-
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48;
-    RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-    HAL_RCC_OscConfig(&RCC_OscInitStruct);
-
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK |
-                                 RCC_CLOCKTYPE_PCLK1;
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI48;
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1);
-
-    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
-    PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
-    HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit);
-
-    __SYSCFG_CLK_ENABLE();
-}
 
 
 #ifdef USE_FULL_ASSERT

@@ -17,4 +17,7 @@ extern RCC_TypeDef clock_sim_rcc;
 #undef RCC
 #define RCC (&clock_sim_rcc)
 
+/* Declared in stm32f0xx_hal.h, which needs the ARM core headers */
+HAL_StatusTypeDef HAL_InitTick(uint32_t TickPriority);
+
 #endif

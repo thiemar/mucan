@@ -17,7 +17,7 @@ PROJECT := app
 BUILD   := build/
 
 OBJECTS := $(addprefix $(BUILD), \
-	app/main.o app/boot.o app/can.o app/slcan.o \
+	app/main.o app/boot.o app/can.o app/clock.o app/slcan.o \
 	app/stm32f0xx_it.o app/vectors.o app/libc.o \
 	sys/stm32f0xx_hal.o sys/stm32f0xx_hal_cortex.o \
 	sys/stm32f0xx_hal_dma.o sys/stm32f0xx_hal_flash.o \

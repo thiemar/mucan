@@ -1,7 +1,9 @@
 /* Start-up, explicit boot-mode selection and watchdog for STM32F042.
  *
- * These boards have PF11/BOOT0 tied high. USER=0xFF selects ROM persistently;
- * USER=0x7F selects application flash. Startup NEVER changes option bytes.
+ * These boards have PF11/BOOT0 tied high. USER=0xFF selects ROM persistently
+ * (stored as an erased pair when this code selects it; factory boards carry a
+ * programmed 0xFF/0x00 pair, which loads the same); USER=0x7F selects
+ * application flash. Startup NEVER changes option bytes.
  * The host may run a development image with DFU :leave while keeping ROM
  * selected. Production selects flash only after readback and a successful
  * application connection. Only explicit commands change the boot mode.
@@ -14,12 +16,14 @@
 
 #define BOOT_OPTION_COUNT 5u /* RDP, USER, DATA0, DATA1, WRP0; no reserved slots. */
 
-/* First in __start, before .data/.bss. Quiesce ROM peripherals/interrupts,
- * map flash vectors and return reset flags. Leaves CPU interrupts masked;
- * the caller enables them after initializing RAM and the HAL tick. */
-uint32_t boot_early(void);
+/* First in __start, before .data/.bss. Quiesce ROM peripherals/interrupts
+ * and map flash vectors. Leaves CPU interrupts masked; the caller enables
+ * them after initializing RAM and the HAL tick. */
+void boot_early(void);
 
-/* Read-only checks/reporting: safe on every application startup. */
+/* Read-only checks/reporting: safe on every application startup.
+ * boot_dfu_available() is the gate boot_prepare_mode(false) applies: BOOT0
+ * reads high and the option bank can be rewritten safely. */
 bool boot_dfu_available(void);
 void boot_read_options(uint16_t options[BOOT_OPTION_COUNT]);
 
@@ -32,6 +36,14 @@ void boot_read_options(uint16_t options[BOOT_OPTION_COUNT]);
  * be reconstructed. Never downgrades active RDP1 to RDP0 (that erases flash).
  * Flash selection requires the effective 0xFF/0x7F profile and valid RDP0;
  * an invalid USER pair defaults to 0xFF and can be repaired at this point.
+ * ROM selection additionally requires BOOT0 to read high; otherwise the reset
+ * would simply restart the application.
+ *
+ * Selecting ROM from flash erases the bank and rewrites it, RDP first and
+ * USER left erased. Power loss during that erase can leave RDP erased, which
+ * reads as level 1 (recoverable from ROM, at the cost of the application).
+ * Selecting flash after a ROM selection only programs the erased USER pair
+ * in place, so the production commit never erases the bank.
  * ROM recovery can retain RDP1 for host Read Unprotect/reflash after
  * hardware ROM boot.
  *

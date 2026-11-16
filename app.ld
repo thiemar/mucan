@@ -112,12 +112,6 @@ SECTIONS
     _ebss = ABSOLUTE(.);
   } > sram
 
-  /* Not initialised at start-up, so values survive a system reset */
-  .noinit (NOLOAD) : ALIGN(4) {
-    *(.noinit .noinit.*)
-    . = ALIGN(4);
-  } > sram
-
   ASSERT((_eronly & 3) == 0, ".data flash source must be word aligned")
   ASSERT(((_sdata | _edata | _sbss | _ebss) & 3) == 0,
          "startup copy/clear boundaries must be word aligned")

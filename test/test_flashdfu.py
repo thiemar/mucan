@@ -53,6 +53,7 @@ class FakeBoard:
         self.commit_corrupt = False
         self.commit_failure = False
         self.handshake_failure = False
+        self.dfu_rejected = False
         self.option_reply = None
         self.layout = "032*0001Kg"
         self.targets = []
@@ -140,6 +141,8 @@ class FakeBoard:
         if path != self.port:
             raise AssertionError("Operation targeted the wrong CDC port")
         self.event("command", command)
+        if command == b"__dfu" and self.dfu_rejected:
+            raise flashdfu.CommandRejected("Application rejected __dfu")
         if command == b"__dfu":
             self.dfu, self.app = True, False
             return b""
@@ -392,6 +395,23 @@ class WorkflowTests(unittest.TestCase):
         self.run_update()
         self.assertIn(("command", b"__dfu"), self.board.events)
 
+    def test_rejected_rom_selection_explains_boot0_and_stops(self):
+        self.board.dfu, self.board.app = False, True
+        self.board.dfu_rejected = True
+        self.args.device = self.board.port
+        with self.assertRaisesRegex(flashdfu.FlashError, "BOOT0"):
+            self.run_update()
+        self.assertFalse(any(event[0] == "list" for event in self.board.events[1:]))
+        self.assert_no_write_or_commit()
+
+    def test_rdp_after_serial_entry_explains_interrupted_option_rewrite(self):
+        self.board.dfu, self.board.app = False, True
+        self.args.device = self.board.port
+        self.board.options_raw = bytes.fromhex("FFFFFFFF12ED34CBFF00")
+        with self.assertRaisesRegex(flashdfu.FlashError, "rewrote its option bytes for __dfu"):
+            self.run_update()
+        self.assert_no_write_or_commit()
+
     def test_different_device_after_serial_entry_is_rejected_before_write(self):
         self.board.dfu, self.board.app = False, True
         self.args.device = self.board.port
@@ -534,8 +554,8 @@ class SerialTransportTests(unittest.TestCase):
         self.events.append(("write", data))
         if self.serial_error:
             raise self.serial_error
-        if data != b"\rC\r":
-            self.pending.extend(self.reply)
+        # The flush (an empty line) is answered with BELL, like the firmware
+        self.pending.extend(b"\a" if data == b"\r" else self.reply)
         return len(data)
 
     def reset_input_buffer(self):
@@ -556,9 +576,19 @@ class SerialTransportTests(unittest.TestCase):
                 mock.patch.object(flashdfu.time, "monotonic", side_effect=lambda: next(ticks)):
             return self.ports.command("/dev/fake", command)
 
-    def test_closes_can_and_discards_stale_data_before_handshake(self):
+    def test_flushes_without_closing_can_and_drains_stale_data(self):
         self.assertEqual(self.command(), b"v0003")
-        self.assertEqual(self.events, [("write", b"\rC\r"), ("reset",), ("write", b"v\r"), ("flush",)])
+        self.assertEqual(self.events, [("write", b"\r"), ("write", b"v\r"), ("flush",)])
+        self.assertFalse(any(b"C" in event[1] for event in self.events if event[0] == "write"))
+
+    def test_received_frames_around_the_reply_are_skipped(self):
+        self.reply = b"t1230\rR123456780\rT0000000112\rv0003\rt7FF0\r"
+        self.assertEqual(self.command(), b"v0003")
+
+    def test_rejection_is_distinguishable(self):
+        self.reply = b"\a"
+        with self.assertRaises(flashdfu.CommandRejected):
+            self.command(b"__dfu")
 
     def test_empty_success_ack(self):
         self.reply = b"\r"

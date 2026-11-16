@@ -142,7 +142,7 @@ static inline void hw_set_address(uint8_t address) {
 static inline void hw_start(void) {
     volatile uint32_t i;
 
-    /* USB clock source (HSI48) is selected in SystemClock_Config() */
+    /* USB clock source (HSI48) is selected in clock_init() */
     RCC->APB1ENR |= RCC_APB1ENR_USBEN;
 
     /* Power up the transceiver (PDWN=0) while holding the core in reset */
@@ -913,7 +913,9 @@ static void ctrl_out_received(void) {
     ctrl.out_got = (uint16_t)(ctrl.out_got + n);
 
     if (ctrl.out_got < ctrl.out_len && n == EP0_SIZE) {
-        ep_set_rx_status(EP_CTRL, RX_VALID);
+        /* usb_poll() disabled both directions; NAK any IN until the data
+         * stage is complete rather than leaving the host without a reply */
+        ep_set_status(EP_CTRL, RX_VALID, TX_NAK);
     } else if (ctrl_out_complete()) {
         ctrl_ack();
     } else {

@@ -12,9 +12,8 @@
 #define USER_BOOT_SEL 0x80u
 #define USER_NBOOT1 0x10u
 #define USER_NBOOT0 0x08u
-#define RESET_FLAGS \
-    (RCC_CSR_LPWRRSTF | RCC_CSR_WWDGRSTF | RCC_CSR_IWDGRSTF | RCC_CSR_SFTRSTF | \
-     RCC_CSR_PORRSTF | RCC_CSR_PINRSTF | RCC_CSR_OBLRSTF | RCC_CSR_V18PWRRSTF)
+#define USER_ROM 0xFFu
+#define BOOT0_PIN (1u << 11) /* PF11 doubles as BOOT0 on the STM32F042 */
 
 #define IWDG_KEY_RELOAD 0xAAAAu
 #define IWDG_KEY_UNLOCK 0x5555u
@@ -25,8 +24,7 @@
 /* Also used internally by the bundled HAL flash extension. */
 extern HAL_StatusTypeDef FLASH_WaitForLastOperation(uint32_t timeout);
 
-uint32_t boot_early(void) {
-    uint32_t reset_flags = RCC->CSR & RESET_FLAGS;
+void boot_early(void) {
     const uint32_t apb1 = RCC_APB1RSTR_USBRST | RCC_APB1RSTR_CRSRST |
                           RCC_APB1RSTR_I2C1RST | RCC_APB1RSTR_USART2RST;
     const uint32_t gpio = RCC_AHBRSTR_GPIOARST | RCC_AHBRSTR_GPIOBRST |
@@ -47,12 +45,10 @@ uint32_t boot_early(void) {
     RCC->AHBRSTR &= ~gpio;
     NVIC->ICPR[0] = 0xFFFFFFFFu;
     SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
-    RCC->CSR |= RCC_CSR_RMVF;
     RCC->APB2ENR |= RCC_APB2ENR_SYSCFGCOMPEN;
     SYSCFG->CFGR1 &= ~SYSCFG_CFGR1_MEM_MODE;
     __DSB();
     __ISB();
-    return reset_flags;
 }
 
 /* RM0091 4.1.3: F042 implements only these five halfwords, not WRP1/2/3. */
@@ -93,9 +89,18 @@ static bool option_snapshot(uint16_t image[BOOT_OPTION_COUNT]) {
     return true;
 }
 
+/* With BOOT_SEL set the BOOT0 pin chooses ROM or flash, so selecting ROM only
+ * works when the pin is high. Reads the pin through its GPIO input (PF11 is
+ * an input after reset and after boot_early()). */
+static bool boot0_high(void) {
+    RCC->AHBENR |= RCC_AHBENR_GPIOFEN;
+    (void)RCC->AHBENR; /* let the clock enable take effect before reading */
+    return (GPIOF->IDR & BOOT0_PIN) != 0u;
+}
+
 bool boot_dfu_available(void) {
     uint16_t image[BOOT_OPTION_COUNT];
-    return option_snapshot(image);
+    return boot0_high() && option_snapshot(image);
 }
 
 static bool options_unlock(void) {
@@ -119,6 +124,44 @@ static bool option_program(unsigned index, uint16_t pair) {
     HAL_StatusTypeDef status = FLASH_WaitForLastOperation(OPTION_TIMEOUT_MS);
     FLASH->CR &= ~FLASH_CR_OPTPG;
     return status == HAL_OK && option_read(index) == pair;
+}
+
+/* The stored pair already loads as `target`. An erased USER pair and a
+ * programmed 0xFF/0x00 pair both load as 0xFF. */
+static bool option_matches(unsigned index, uint16_t target) {
+    uint16_t stored = option_read(index);
+    return stored == target ||
+           (index == OPTION_USER && target == 0xFFFFu && stored == option_pair(USER_ROM));
+}
+
+/* Every pair that differs from the target is still erased, so the target can
+ * be reached by programming alone, without erasing the bank. */
+static bool options_programmable_in_place(const uint16_t image[BOOT_OPTION_COUNT]) {
+    for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) {
+        uint16_t stored = option_read(i);
+        if (stored != image[i] && stored != 0xFFFFu) return false;
+    }
+    return true;
+}
+
+/* No erase, so RDP is never exposed. USER is still programmed last. If this
+ * fails part-way, USER is erased or a partly programmed (invalid) pair, both
+ * of which load as 0xFF: the ROM selection that was in place before. */
+static bool options_program_in_place(const uint16_t image[BOOT_OPTION_COUNT]) {
+    if (FLASH_WaitForLastOperation(OPTION_TIMEOUT_MS) != HAL_OK) return false;
+    for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) {
+        if (i != OPTION_USER && option_read(i) != image[i] && !option_program(i, image[i])) {
+            return false;
+        }
+    }
+    if (option_read(OPTION_USER) != image[OPTION_USER] &&
+        !option_program(OPTION_USER, image[OPTION_USER])) {
+        return false;
+    }
+    for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) {
+        if (option_read(i) != image[i]) return false;
+    }
+    return true;
 }
 
 static bool options_write(const uint16_t image[BOOT_OPTION_COUNT]) {
@@ -146,6 +189,7 @@ static bool options_write(const uint16_t image[BOOT_OPTION_COUNT]) {
 
 bool boot_prepare_mode(bool flash_boot) {
     uint16_t original[BOOT_OPTION_COUNT], updated[BOOT_OPTION_COUNT];
+    if (!flash_boot && !boot_dfu_available()) return false;
     if (!option_snapshot(original)) return false;
     if (flash_boot && ((FLASH->OBR & FLASH_OBR_RDPRT1) ||
                       original[OPTION_RDP] != option_pair(0xAA) ||
@@ -162,17 +206,26 @@ bool boot_prepare_mode(bool flash_boot) {
     for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) updated[i] = original[i];
     uint8_t user = (uint8_t)original[OPTION_USER] | USER_NBOOT1;
     user = flash_boot ? (user & ~USER_BOOT_SEL) | USER_NBOOT0 : user | USER_BOOT_SEL;
-    updated[OPTION_USER] = option_pair(user);
+    /* Store the standard ROM selection as an erased USER pair. It loads as
+     * 0xFF like the programmed pair, but the later flash commit can then
+     * program USER in place instead of erasing the whole bank, which would
+     * briefly leave RDP erased (= level 1) on the way. */
+    updated[OPTION_USER] = user == USER_ROM ? 0xFFFFu : option_pair(user);
     for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) {
-        if (option_read(i) != updated[i]) unchanged = false;
+        if (!option_matches(i, updated[i])) unchanged = false;
     }
     if (unchanged) return true;
     if (!options_unlock()) return false;
-    bool success = options_write(updated);
-    if (!success) {
-        /* Application flash is still intact. One bounded attempt restores
-         * its original effective options; no reload or ACK on failure. */
-        (void)options_write(original);
+    bool success;
+    if (options_programmable_in_place(updated)) {
+        success = options_program_in_place(updated);
+    } else {
+        success = options_write(updated);
+        if (!success) {
+            /* Application flash is still intact. One bounded attempt restores
+             * its original effective options; no reload or ACK on failure. */
+            (void)options_write(original);
+        }
     }
     HAL_FLASH_OB_Lock();
     HAL_FLASH_Lock();

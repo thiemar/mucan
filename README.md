@@ -15,7 +15,7 @@ USB to CAN adapter based on the STM32F042. It appears as a USB serial port
 | `riiil` / `Riiiiiiiil` | Send a remote frame | `z\r` / `Z\r` |
 | `F` | Status flags (channel open), as two hex digits | `Fxx\r` |
 | `V` / `v` / `N` | Hardware version, firmware version, serial number | `V0001\r`, `v0003\r`, `Nxxxx\r` |
-| `__dfu` / `__bootrom` | Select persistent ROM DFU boot, then restart | `\r` |
+| `__dfu` / `__bootrom` | Select persistent ROM DFU boot, then restart (BELL if BOOT0 reads low) | `\r` |
 | `__bootflash` | Select persistent application boot, then restart | `\r` |
 | `__options` | Read the five raw option/complement pairs in address order | `OB` + 20 hex digits + `\r` |
 
@@ -46,7 +46,8 @@ This produces `firmware/app.bin`. To use a toolchain that isn't on your PATH:
     make CROSS=/path/to/bin/arm-none-eabi-
 
 `make test` runs the host-side unit tests for USB, CAN, explicit boot-option
-changes, inherited clocks, SLCAN, the firmware updater, the ROM DFU protocol
+changes, clock start-up (including the SysTick retune after the switch to
+48 MHz), SLCAN, the firmware updater, the ROM DFU protocol
 and the libusb binding. It needs Python 3 and a host C compiler with
 AddressSanitizer support (clang or gcc). The updater tests use fake host tools
 and do not access a USB device.
@@ -126,10 +127,19 @@ the committed options. The host utility does not write option-byte images
 through DFU.
 
 For the standard production configuration, the USER byte is `0xFF` for ROM
-boot and `0x7F` for application boot. The application preserves valid
-implemented option pairs and normalizes invalid pairs to their effective
-erased `0xFF` setting. It verifies each write and programs USER last. When
-the stored options already match the requested mode, it skips programming.
+boot and `0x7F` for application boot. When the application selects ROM it
+stores USER as an erased pair (`FF FF`), which loads as `0xFF` exactly like
+the factory's programmed `FF 00`. The application preserves valid implemented
+option pairs and normalizes invalid pairs to their effective erased `0xFF`
+setting. It verifies each write and programs USER last. When the stored
+options already match the requested mode, it skips programming.
+
+Selecting ROM on a production board erases and rewrites the option bank (RDP
+first). Selecting the application afterwards only programs the erased USER
+pair in place, so the production commit never erases the bank. A first
+`--production` on a factory board does erase it once. `__dfu` is refused with
+BELL if BOOT0 reads low, because the reset would only restart the
+application.
 
 #### Interrupted updates and recovery
 
@@ -140,8 +150,9 @@ updater refuses to write application flash if it cannot establish this
 boot configuration.
 
 An erased or invalid USER option pair is interpreted as `0xFF`, which selects
-ROM with this board's high BOOT0. An interrupted option-bank operation can
-also leave RDP at level 1. Explicit recovery removes that protection and
+ROM with this board's high BOOT0. Losing power while the option bank is
+erased and rewritten (during `__dfu` on a production board, about 40 ms) can
+also leave RDP erased, which reads as level 1. Explicit recovery removes that protection and
 **erases the application**, then reflashes and verifies the supplied image:
 
     tools/flashdfu.sh --recover

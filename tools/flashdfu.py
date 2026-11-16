@@ -28,6 +28,10 @@ class CommitUnverified(FlashError):
     pass
 
 
+class CommandRejected(FlashError):
+    """The application answered a serial command with BELL."""
+
+
 def validate_firmware(image):
     if not 192 <= len(image) <= FLASH_SIZE or len(image) % 4:
         raise FlashError("Firmware must be a word-aligned raw image of 192..32768 bytes")
@@ -100,21 +104,45 @@ class SerialPorts:
             raise FlashError("Requested CDC port does not identify one adapter with a full STM32 UID")
         return matches[0].serial_number.upper()
 
+    @staticmethod
+    def _drain(port, quiet=0.1, limit=1.0):
+        """Discard input until the adapter has been quiet for `quiet` seconds
+        (or `limit` seconds pass, if received CAN frames keep arriving)."""
+        start = last = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if port.read(256):
+                last = now
+            elif now - last >= quiet or now - start >= limit:
+                return
+
     def command(self, path, command):
+        """Send one SLCAN command and return its reply line (without the CR).
+
+        Leaves an open CAN channel alone: received frames (t/T/r/R lines) that
+        arrive alongside the reply are skipped.
+        """
         try:
             with self.serial.Serial(path, 115200, timeout=0.05, write_timeout=2) as port:
-                port.write(b"\rC\r")  # End partial input and close any CAN channel.
-                time.sleep(0.1)
-                port.reset_input_buffer()
+                # End any partial command the adapter holds, then wait until its
+                # reply (and anything else already queued) has been discarded, so
+                # a late BELL can't be mistaken for a rejection of `command`.
+                port.write(b"\r")
+                self._drain(port)
                 port.write(command + b"\r")
                 port.flush()
                 line = bytearray()
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
                     byte = port.read(1)
+                    if not byte:
+                        continue
                     if byte == b"\a":
-                        raise FlashError(f"Application rejected {command.decode()}")
+                        raise CommandRejected(f"Application rejected {command.decode()}")
                     if byte == b"\r":
+                        if line[:1] in (b"t", b"T", b"r", b"R"):
+                            line.clear()  # a received CAN frame, not our reply
+                            continue
                         return bytes(line)
                     line += byte
                     if len(line) > 96:
@@ -182,7 +210,14 @@ def update(args, image, tool, ports, sleep=time.sleep):
     if args.device:
         requested_uid = ports.uid_for_path(args.device)
         before = {d.key for d in tool.devices()}
-        if ports.command(args.device, b"__dfu") != b"":
+        try:
+            ack = ports.command(args.device, b"__dfu")
+        except CommandRejected as exc:
+            raise FlashError("The adapter refused to select ROM boot (__dfu); it is still running "
+                             "the application. ROM selection needs BOOT0 to read high and "
+                             "option bytes the application can rewrite: check the board's "
+                             "BOOT0 connection and read __options.") from exc
+        if ack != b"":
             raise FlashError("Invalid acknowledgement of __dfu")
     device = wait_dfu(tool, args.timeout, args.dfu_serial, args.dfu_path, before, sleep)
     if args.recover:
@@ -194,8 +229,13 @@ def update(args, image, tool, ports, sleep=time.sleep):
     try:
         options = validate_options(tool.options(device))
     except FlashError as exc:
-        raise FlashError(f"ROM preflight failed before application write: {exc}. "
-                         "If read protection is enabled, --recover explicitly authorizes destructive Read Unprotect.") from exc
+        hint = ("If read protection is enabled, --recover explicitly authorizes destructive "
+                "Read Unprotect.")
+        if args.device:
+            hint += (" Losing power while the adapter rewrote its option bytes for __dfu "
+                     "leaves RDP erased, which reads as level 1; --recover then restores "
+                     "level 0 by erasing the application and writes this image.")
+        raise FlashError(f"ROM preflight failed before application write: {exc}. {hint}") from exc
     uid = tool.uid(device)
     if requested_uid is not None and uid != requested_uid:
         raise FlashError("ROM DFU UID differs from the requested CDC adapter; no firmware write")

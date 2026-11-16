@@ -31,18 +31,17 @@ static void cut_prepare(bool flash_boot) {
 
 static void test_startup_is_read_only_and_quiesces_rom(void) {
     for (unsigned user = 0; user <= 255; ++user) {
-        for (unsigned retained_flags = 0; retained_flags < 2; ++retained_flags) {
+        {
             boot_sim_init(user, 0xAA);
             uint16_t before[BOOT_OPTION_COUNT], after[BOOT_OPTION_COUNT];
             boot_read_options(before);
-            RCC->CSR = retained_flags ? RCC_CSR_PORRSTF : 0;
             SYSCFG->CFGR1 = SYSCFG_CFGR1_MEM_MODE_0 | (1u << 8);
             SysTick->CTRL = 7;
             SysTick->LOAD = 47999;
             SysTick->VAL = 1234;
             NVIC->ICER[0] = NVIC->ICPR[0] = 0;
             SCB->ICSR = 0;
-            assert(boot_early() == (retained_flags ? RCC_CSR_PORRSTF : 0));
+            boot_early();
             assert(boot_sim_irq_disabled);
             assert(!SysTick->CTRL && !SysTick->LOAD && !SysTick->VAL);
             assert(NVIC->ICER[0] == 0xFFFFFFFFu && NVIC->ICPR[0] == 0xFFFFFFFFu);
@@ -93,8 +92,12 @@ static void test_preserve_all_user_bits_and_bank(void) {
         boot_read_options(original);
         assert(boot_dfu_available());
         assert(boot_prepare_mode(false));
+        /* Standard ROM selection is stored erased; an already-equivalent
+         * programmed 0xFF is left alone; other USER bits are kept exactly. */
+        uint16_t rom_user = (user | 0x90u) != 0xFFu ? pair(user | 0x90u)
+                            : user == 0xFFu ? pair(0xFF) : 0xFFFFu;
         for (unsigned i = 0; i < BOOT_OPTION_COUNT; ++i) {
-            assert(boot_sim_get_option(i) == (i == 1 ? pair(user | 0x90u) : original[i]));
+            assert(boot_sim_get_option(i) == (i == 1 ? rom_user : original[i]));
         }
         assert(!boot_sim_main_flash_erased);
         apply(BOOT_SIM_RELOAD);
@@ -105,11 +108,11 @@ static void test_preserve_all_user_bits_and_bank(void) {
     fill_bank(0x7F);
     FLASH->CR = FLASH_CR_OPTWRE; /* ROM may leave flash already unlocked. */
     assert(boot_prepare_mode(false));
-    assert(OB->USER == pair(0xFF));
+    assert(OB->USER == 0xFFFFu);
 }
 
 static void test_failed_writes_restore_bank(void) {
-    for (unsigned failure = 1; failure <= 5; ++failure) {
+    for (unsigned failure = 1; failure <= 4; ++failure) { /* ROM leaves USER erased */
         for (unsigned corruption = 0; corruption < 2; ++corruption) {
             fill_bank(0x7F);
             uint16_t original[BOOT_OPTION_COUNT];
@@ -214,7 +217,7 @@ static void test_unlock_and_reload_failures(void) {
     assert(boot_prepare_mode(false));
     boot_sim_fail_launch = true;
     apply(BOOT_SIM_RESET); /* Fallback reset; raw verified target survives. */
-    assert(active_user() == 0x7F && OB->USER == pair(0xFF));
+    assert(active_user() == 0x7F && OB->USER == 0xFFFFu);
     assert(FLASH->CR & FLASH_CR_LOCK);
 }
 
@@ -235,7 +238,7 @@ static uint16_t zero_subset(uint16_t target, unsigned subset) {
 static void test_power_cuts_during_program(void) {
     const unsigned order[] = { 0, 2, 3, 4, 1 };
     for (unsigned flash_boot = 0; flash_boot < 2; ++flash_boot) {
-        for (unsigned position = 0; position < 5; ++position) {
+        for (unsigned position = 0; position < (flash_boot ? 5u : 4u); ++position) {
             for (unsigned subset = 0; subset < 256; ++subset) {
                 fill_bank(flash_boot ? 0xFF : 0x7F);
                 unsigned index = order[position];
@@ -278,6 +281,65 @@ static void test_power_cuts_during_erase(void) {
         }
     }
 }
+static void test_rom_selection_requires_boot0_high(void) {
+    fill_bank(0x7F);
+    GPIOF->IDR = 0; /* BOOT0 low: a ROM selection would just reboot the app */
+    assert(!boot_dfu_available());
+    assert(!boot_prepare_mode(false));
+    assert(!boot_sim_erases && !boot_sim_programs && OB->USER == pair(0x7F));
+    assert(FLASH->CR & FLASH_CR_LOCK);
+    assert(boot_prepare_mode(true)); /* flash selection ignores the pin */
+    GPIOF->IDR = 1u << 11;
+    assert(boot_dfu_available());
+    assert(boot_prepare_mode(false));
+    assert(OB->USER == 0xFFFFu);
+}
+
+/* Production -> ROM -> production, as an update does: only the first step
+ * erases the bank; the commit programs the erased USER pair in place. */
+static void test_flash_commit_programs_in_place(void) {
+    fill_bank(0x7F);
+    assert(boot_prepare_mode(false));
+    assert(boot_sim_erases == 1 && OB->USER == 0xFFFFu);
+    apply(BOOT_SIM_RELOAD);
+    assert(active_user() == 0xFF);
+
+    unsigned programs = boot_sim_programs;
+    assert(boot_prepare_mode(true));
+    assert(boot_sim_erases == 1);
+    assert(boot_sim_programs == programs + 1 && boot_sim_program_order[programs] == 1);
+    assert(OB->RDP == pair(0xAA) && OB->USER == pair(0x7F));
+    for (unsigned i = 2; i < 5; ++i) assert(boot_sim_get_option(i) == pair(0xA0 + i));
+    assert(FLASH->CR & FLASH_CR_LOCK);
+    assert(!(FLASH->CR & FLASH_CR_OPTWRE));
+    apply(BOOT_SIM_RELOAD);
+    assert(active_user() == 0x7F);
+
+    /* A failed in-place write needs no restore: USER still loads as ROM */
+    fill_bank(0x7F);
+    assert(boot_prepare_mode(false));
+    apply(BOOT_SIM_RELOAD);
+    boot_sim_fail_program = boot_sim_programs + 1;
+    assert(!boot_prepare_mode(true));
+    assert(boot_sim_erases == 1 && OB->USER == 0xFFFFu && OB->RDP == pair(0xAA));
+    assert(FLASH->CR & FLASH_CR_LOCK);
+    boot_sim_load_options();
+    assert(active_user() == 0xFF);
+
+    /* Power lost part-way through the USER write: RDP is never erased, and
+     * anything short of the complete pair still loads as ROM */
+    for (unsigned subset = 0; subset < 256; ++subset) {
+        fill_bank(0x7F);
+        assert(boot_prepare_mode(false));
+        apply(BOOT_SIM_RELOAD);
+        boot_sim_cut_operation = boot_sim_operations + 1;
+        boot_sim_cut_mask = zero_subset(pair(0x7F), subset);
+        cut_prepare(true);
+        assert(OB->RDP == pair(0xAA) && !(FLASH->OBR & FLASH_OBR_RDPRT1));
+        assert(active_user() == (subset == 0 ? 0x7F : 0xFF));
+    }
+}
+
 int main(void) {
     test_startup_is_read_only_and_quiesces_rom();
     test_modes_and_commit_order();
@@ -287,6 +349,8 @@ int main(void) {
     test_unlock_and_reload_failures();
     test_power_cuts_during_program();
     test_power_cuts_during_erase();
+    test_rom_selection_requires_boot0_high();
+    test_flash_commit_programs_in_place();
     puts("boot: all tests passed");
     return 0;
 }
