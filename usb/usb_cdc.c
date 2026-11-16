@@ -150,6 +150,10 @@ static inline void hw_start(void) {
 static inline void hw_connect(void) {
     USB->BCDR |= USB_BCDR_DPPU;
 }
+
+static inline void hw_disconnect(void) {
+    USB->BCDR &= (uint16_t)~USB_BCDR_DPPU;
+}
 #endif
 
 /* ------------------------------------------------------------------------ */
@@ -921,6 +925,11 @@ void usb_init(void) {
     hw_connect();
 }
 
+void usb_disconnect(void) {
+    hw_disconnect();
+    set_configuration(0);
+}
+
 void usb_poll(void) {
     uint8_t pass;
 
@@ -1038,4 +1047,8 @@ bool usb_cdc_write(const uint8_t *data, uint16_t len) {
 
     cdc_tx_pump();
     return true;
+}
+
+bool usb_cdc_tx_empty(void) {
+    return tx_head == tx_tail && !tx_busy && !tx_zlp_pending;
 }

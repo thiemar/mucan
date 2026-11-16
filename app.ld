@@ -110,6 +110,11 @@ SECTIONS
     _ebss = ABSOLUTE(.);
   } > sram
 
+  /* Not initialised at start-up, so values survive a system reset */
+  .noinit (NOLOAD) : {
+    *(.noinit .noinit.*)
+  } > sram
+
   /* Stabs debugging sections. */
   .stab 0 : { *(.stab) }
   .stabstr 0 : { *(.stabstr) }

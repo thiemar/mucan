@@ -24,6 +24,7 @@ volatile uint16_t *hw_pma(uint16_t offset);
 void hw_set_address(uint8_t address);
 void hw_start(void);
 void hw_connect(void);
+void hw_disconnect(void);
 
 extern const uint8_t sim_uid[12];
 #define HW_UID sim_uid

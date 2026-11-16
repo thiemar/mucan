@@ -1,0 +1,27 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Build firmware
+        run: make -j"$(nproc)"
+
+      - name: Host tests
+        run: make test
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: firmware/app.bin

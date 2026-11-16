@@ -18,6 +18,9 @@ void usb_init(void);
 /* Service the peripheral: enumeration, control requests and data endpoints. */
 void usb_poll(void);
 
+/* Drop off the bus (D+ pull-up off), e.g. before resetting into DFU. */
+void usb_disconnect(void);
+
 /* True once the host has selected the configuration. */
 bool usb_cdc_configured(void);
 
@@ -40,5 +43,8 @@ uint16_t usb_cdc_write_space(void);
  * never emit a partial line.
  */
 bool usb_cdc_write(const uint8_t *data, uint16_t len);
+
+/* True once everything written has been collected by the host. */
+bool usb_cdc_tx_empty(void);
 
 #endif /* USB_CDC_H */

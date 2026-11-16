@@ -143,6 +143,10 @@ void hw_connect(void) {
     connected = true;
 }
 
+void hw_disconnect(void) {
+    connected = false;
+}
+
 /* ---- Host side ---------------------------------------------------------- */
 
 static uint16_t bt(uint8_t ep, uint8_t word) {

@@ -513,6 +513,34 @@ static void test_reset_and_reconfigure(void) {
     CHECK_MODEL();
 }
 
+static void test_tx_empty_and_disconnect(void) {
+    uint8_t buf[64], data[64] = {0};
+    uint16_t n;
+    int sizes[4], count;
+
+    enumerate();
+    CHECK(usb_cdc_tx_empty());
+    CHECK(usb_cdc_write((const uint8_t *)"\r", 1));
+    CHECK(!usb_cdc_tx_empty());
+    CHECK(bulk_read(buf, sizeof(buf), sizes, &count) == 1);
+    CHECK(usb_cdc_tx_empty());
+
+    /* After a full packet, not empty until the zero-length packet has gone */
+    CHECK(usb_cdc_write(data, 64));
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 64);
+    usb_poll();
+    CHECK(!usb_cdc_tx_empty());
+    CHECK(sim_in(address, 1, buf, &n) == SIM_ACK && n == 0);
+    usb_poll();
+    CHECK(usb_cdc_tx_empty());
+
+    usb_disconnect();
+    CHECK(!sim_connected());
+    CHECK(!usb_cdc_configured());
+    CHECK(!usb_cdc_write((const uint8_t *)"x", 1));
+    CHECK_MODEL();
+}
+
 /* The host's status-stage OUT completes while the driver is clearing the
  * IN completion flag on the same endpoint register. The original HAL macro
  * wrote the other CTR bit back as read and lost this event. */
@@ -571,6 +599,7 @@ int main(void) {
         {"bulk_in_ring", test_bulk_in_ring},
         {"halt", test_halt},
         {"reset_and_reconfigure", test_reset_and_reconfigure},
+        {"tx_empty_and_disconnect", test_tx_empty_and_disconnect},
         {"ctr_race", test_ctr_race},
     };
 
