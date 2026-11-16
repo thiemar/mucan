@@ -41,7 +41,6 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern PCD_HandleTypeDef hpcd_USB_FS;
 
 /******************************************************************************/
 /*            Cortex-M0 Processor Interruption and Exception Handlers         */
@@ -62,12 +61,6 @@ void __attribute__((used)) SysTick_Handler(void) {
 /* please refer to the startup file (startup_stm32f0xx.s).                    */
 /******************************************************************************/
 
-/**
-* @brief This function handles USB global Interrupt (combined with EXTI line 18 interrupt).
-*/
-void __attribute__((used)) USB_IRQHandler(void) {
-    HAL_PCD_IRQHandler(&hpcd_USB_FS);
-}
 
 /* USER CODE BEGIN 1 */
 

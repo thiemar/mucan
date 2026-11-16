@@ -81,8 +81,12 @@
   * @{
   */
 
+#ifdef CLOCK_SIM
+#include "clock_sim.h"
+#else
 #include "stm32f0xx.h"
 #include "stm32f0xx_hal_conf.h"
+#endif
 
 /**
   * @}
@@ -239,6 +243,11 @@ void SystemCoreClockUpdate (void)
     case RCC_CFGR_SWS_HSE:  /* HSE used as system clock */
       SystemCoreClock = HSE_VALUE;
       break;
+#if defined(STM32F042x6) || defined(STM32F048xx) || defined(STM32F072xB) || defined(STM32F078xx) || defined(STM32F091xC) || defined(STM32F098xx)
+    case RCC_CFGR_SWS_HSI48: /* Direct HSI48, including the ROM DFU clock */
+      SystemCoreClock = HSI48_VALUE;
+      break;
+#endif
     case RCC_CFGR_SWS_PLL:  /* PLL used as system clock */
       /* Get PLL clock source and multiplication factor ----------------------*/
       pllmull = RCC->CFGR & RCC_CFGR_PLLMUL;

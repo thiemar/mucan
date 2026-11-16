@@ -48,7 +48,7 @@ MEMORY
 
 OUTPUT_ARCH(arm)
 
-__stack = ORIGIN(sram) + LENGTH(sram) - 4;
+__stack = ORIGIN(sram) + LENGTH(sram);
 
 ENTRY(__start)      /* treat __start as the anchor for dead code stripping */
 EXTERN(app_vectors)  /* force the vectors to be included in the output */
@@ -92,23 +92,30 @@ SECTIONS
   } > flash
   __exidx_end = ABSOLUTE(.);
 
-  _eronly = ABSOLUTE(.);
-
-  .data : {
+  /* Both the flash source and RAM destination are copied a word at a time. */
+  .data : ALIGN(4) {
     _sdata = ABSOLUTE(.);
     *(.data .data.*)
     *(.gnu.linkonce.d.*)
     CONSTRUCTORS
+    . = ALIGN(4);
     _edata = ABSOLUTE(.);
   } > sram AT > flash
+  _eronly = LOADADDR(.data);
 
-  .bss : {
+  .bss (NOLOAD) : ALIGN(4) {
     _sbss = ABSOLUTE(.);
     *(.bss .bss.*)
     *(.gnu.linkonce.b.*)
     *(COMMON)
+    . = ALIGN(4);
     _ebss = ABSOLUTE(.);
   } > sram
+
+  ASSERT((_eronly & 3) == 0, ".data flash source must be word aligned")
+  ASSERT(((_sdata | _edata | _sbss | _ebss) & 3) == 0,
+         "startup copy/clear boundaries must be word aligned")
+  ASSERT((__stack & 7) == 0, "initial stack must be eight-byte aligned")
 
   /* Stabs debugging sections. */
   .stab 0 : { *(.stab) }

@@ -1,7 +1,13 @@
 #include <stdint.h>
 
+#include "stm32f0xx.h"
+
+/*
+ * Faults and unexpected interrupts restart the device rather than hanging
+ * it; the host sees the adapter re-enumerate.
+ */
 void __attribute__((weak)) default_handler(void) {
-    while (1u);
+    NVIC_SystemReset();
 }
 
 void __attribute__ ((weak, alias ("default_handler")))
