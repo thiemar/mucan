@@ -34,8 +34,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f0xx_hal.h"
-#include "usb_device.h"
-#include "usbd_cdc_if.h"
+#include "usb_cdc.h"
 
 
 volatile extern uint32_t _stext;           /* Start of .text */
@@ -47,21 +46,6 @@ volatile extern uint32_t _sbss;            /* Start of .bss */
 volatile extern uint32_t _ebss;            /* End+1 of .bss */
 
 
-extern USBD_HandleTypeDef  *hUsbDevice_0;
-
-
-/* TX buffer is TX from MCU to USB */
-#define TX_BUFFER_SIZE 1024u
-static uint8_t tx_buffer_0[TX_BUFFER_SIZE];
-static uint8_t tx_buffer_1[TX_BUFFER_SIZE];
-static uint8_t active_buffer;
-static uint8_t active_buffer_length;
-
-
-/* RX buffer is RX from USB to MCU */
-#define RX_BUFFER_SIZE 128u
-volatile uint8_t rx_buffer[RX_BUFFER_SIZE];
-volatile uint8_t rx_buffer_length;
 
 
 const uint8_t hex_chars[] = "0123456789ABCDEF";
@@ -393,7 +377,7 @@ int __start(void) {
     */
     set_dfu_option_bytes(0u);
 
-    MX_USB_DEVICE_Init();
+    usb_init();
 
     /* Configure GPIO for the CAN_SILENT signal */
     GPIO_InitTypeDef GPIO_InitStruct;
@@ -471,279 +455,267 @@ int __start(void) {
 
     HAL_RCCEx_CRSConfig(&crs_config);
 
-    /* Don't continue unless we're synced */
-    while (!(HAL_RCCEx_CRSWaitSynchronization(1000000u) & RCC_CRS_SYNCOK));
+    /*
+    Don't continue unless we're synced. USB is polled, so keep servicing it
+    while we wait -- the host is enumerating the device at the same time.
+    */
+    while (!(HAL_RCCEx_CRSWaitSynchronization(0u) & RCC_CRS_SYNCOK)) {
+        usb_poll();
+    }
+
+    /* Command record */
+    uint8_t current_cmd = 0;
+    uint8_t current_cmd_data[32];
+    uint8_t current_cmd_data_length = 0;
+    uint8_t channel_open = 0;
+    uint8_t usb_session = 0;
 
     while (1) {
-        /* Set up the command record */
-        size_t i;
-        uint8_t current_cmd;
-        uint8_t current_cmd_data[32];
-        uint8_t current_cmd_data_length;
-        uint8_t channel_open;
+        usb_poll();
 
-        current_cmd = current_cmd_data_length = i = 0;
-        channel_open = 0;
-        rx_buffer_length = 0;
+        if (!usb_cdc_configured()) {
+            /* Start from a clean state when the host next configures us */
+            usb_session = 0;
+            continue;
+        }
 
-        while (hUsbDevice_0 && hUsbDevice_0->pClassData) {
-            /*
-            If the RX buffer is non-empty, process any commands/messages in it
-            and then acknowledge the transfer to the USB stack
-            */
-            if (rx_buffer_length) {
-                /*
-                Exit if we've read the entire buffer, or if transmit mailboxes
-                are full and the current command is a transmit.
-                */
-                for (; i < rx_buffer_length &&
-                        ((current_cmd != 't' && current_cmd != 'T') ||
-                         __HAL_CAN_GET_FLAG(&hcan, CAN_FLAG_TME0)); i++) {
-                    if (rx_buffer[i] == '\r') {
-                        uint8_t *buf = active_buffer ? tx_buffer_1 :
-                                                       tx_buffer_0;
+        if (!usb_session) {
+            usb_session = 1;
+            current_cmd = current_cmd_data_length = 0;
+            channel_open = 0;
+        }
 
-                        /* End of command -- process and reset state */
-                        switch (current_cmd) {
-                            case 'S':
-                                /*
-                                Setup bitrate -- data should be a number from
-                                0 to 8.
-                                */
-                                if (current_cmd_data[0] < '0' ||
-                                        current_cmd_data[0] > '8') {
-                                    buf[active_buffer_length++] = '\a';
-                                } else if (set_can_bitrate(
-                                        &hcan,
-                                        bitrate_lookup[current_cmd_data[0] - '0'])) {
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 'O':
-                                /*
-                                Open channel -- take CAN out of silent mode
-                                and start receiving.
-                                */
-                                if (!channel_open) {
-                                    channel_open = 1;
-                                    set_can_silent(&hcan, 0);
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 'L':
-                                /*
-                                Open in listen-only -- CAN should already be
-                                in silent mode but just make sure.
-                                */
-                                if (!channel_open) {
-                                    channel_open = 1;
-                                    set_can_silent(&hcan, 1);
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 'C':
-                                /*
-                                Close channel -- put CAN back in silent mode.
-                                */
-                                if (channel_open) {
-                                    channel_open = 0;
-                                    set_can_silent(&hcan, 1);
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 'V':
-                                /* Hardware version */
-                                buf[active_buffer_length++] = 'V';
-                                buf[active_buffer_length++] = '0';
-                                buf[active_buffer_length++] = '0';
-                                buf[active_buffer_length++] = '0';
-                                buf[active_buffer_length++] = '1';
-                                buf[active_buffer_length++] = '\r';
-                                break;
-                            case 'v':
-                                /* Major/minor version */
-                                buf[active_buffer_length++] = 'v';
-                                buf[active_buffer_length++] = '0';
-                                buf[active_buffer_length++] = '0';
-                                buf[active_buffer_length++] = '0';
-                                buf[active_buffer_length++] = '1';
-                                buf[active_buffer_length++] = '\r';
-                                break;
-                            case 'N':
-                                /* Serial number */
-                                buf[active_buffer_length++] = 'N';
-                                buf[active_buffer_length++] = 'F';
-                                buf[active_buffer_length++] = 'F';
-                                buf[active_buffer_length++] = 'F';
-                                buf[active_buffer_length++] = 'F';
-                                buf[active_buffer_length++] = '\r';
-                                break;
-                            case 'T':
-                                /* Extended message */
-                                if (read_ext_message(&tx_msg, current_cmd_data,
-                                                     current_cmd_data_length) &&
-                                        HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 't':
-                                /* Standard message */
-                                if (read_std_message(&tx_msg, current_cmd_data,
-                                                     current_cmd_data_length) &&
-                                        HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 'R':
-                                /* Extended RTR */
-                                if (read_ext_rtr(&tx_msg, current_cmd_data,
-                                                 current_cmd_data_length) &&
-                                        HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 'r':
-                                /* Standard RTR */
-                                if (read_std_rtr(&tx_msg, current_cmd_data,
-                                                 current_cmd_data_length) &&
-                                        HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
-                                    buf[active_buffer_length++] = '\r';
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case '_':
-                                /* Bootloader request */
-                                if (current_cmd_data[0] == '_' &&
-                                        current_cmd_data[1] == 'd' &&
-                                        current_cmd_data[2] == 'f' &&
-                                        current_cmd_data[3] == 'u') {
-                                    /*
-                                    Set option bytes to force bootloader entry
-                                    */
-                                    set_dfu_option_bytes(1u);
+        /*
+        Process commands/messages from the host. Stop if the transmit
+        mailboxes are full and the current command is a transmit; unread
+        bytes stay in the USB driver, which NAKs the host until they're
+        consumed.
+        */
+        while ((current_cmd != 't' && current_cmd != 'T') ||
+                __HAL_CAN_GET_FLAG(&hcan, CAN_FLAG_TME0)) {
+            int ch = usb_cdc_getc();
 
-                                    NVIC_SystemReset();
-                                } else {
-                                    buf[active_buffer_length++] = '\a';
-                                }
-                                break;
-                            case 'F':
-                                /* Read status flags -- return 4 hex digits */
-                            case 'Z':
-                                /* Timestamp on/off -- 0=off, 1=on */
-                            case 'M':
-                                /* Acceptance mask -- 8 hex digits */
-                            case 'm':
-                                /* Acceptance value -- 8 hex digits */
-                            case 's':
-                                /* Set bitrate register -- 6 hex digits */
-                            default:
-                                /* NACK */
-                                buf[active_buffer_length++] = '\a';
-                                break;
-                        }
+            if (ch < 0) {
+                break;
+            }
 
-                        current_cmd = current_cmd_data_length = 0;
-                    } else if (current_cmd) {
-                        /* Command data -- save it */
-                        current_cmd_data[current_cmd_data_length++] =
-                            rx_buffer[i];
+            if (ch == '\r') {
+                uint8_t buf[8];
+                uint8_t buf_len = 0;
 
-                        /* Reset command state if the data is too long */
-                        if (current_cmd_data_length == 32u) {
-                            current_cmd = current_cmd_data_length = 0;
-                        }
-                    } else {
+                /* End of command -- process and reset state */
+                switch (current_cmd) {
+                    case 'S':
                         /*
-                        The first letter of a line is the command type --
-                        don't bother validating as we can't NACK until the
-                        data has been received.
+                        Setup bitrate -- data should be a number from
+                        0 to 8.
                         */
-                        current_cmd = rx_buffer[i];
-                    }
+                        if (current_cmd_data[0] < '0' ||
+                                current_cmd_data[0] > '8') {
+                            buf[buf_len++] = '\a';
+                        } else if (set_can_bitrate(
+                                &hcan,
+                                bitrate_lookup[current_cmd_data[0] - '0'])) {
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 'O':
+                        /*
+                        Open channel -- take CAN out of silent mode
+                        and start receiving.
+                        */
+                        if (!channel_open) {
+                            channel_open = 1;
+                            set_can_silent(&hcan, 0);
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 'L':
+                        /*
+                        Open in listen-only -- CAN should already be
+                        in silent mode but just make sure.
+                        */
+                        if (!channel_open) {
+                            channel_open = 1;
+                            set_can_silent(&hcan, 1);
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 'C':
+                        /*
+                        Close channel -- put CAN back in silent mode.
+                        */
+                        if (channel_open) {
+                            channel_open = 0;
+                            set_can_silent(&hcan, 1);
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 'V':
+                        /* Hardware version */
+                        buf[buf_len++] = 'V';
+                        buf[buf_len++] = '0';
+                        buf[buf_len++] = '0';
+                        buf[buf_len++] = '0';
+                        buf[buf_len++] = '1';
+                        buf[buf_len++] = '\r';
+                        break;
+                    case 'v':
+                        /* Major/minor version */
+                        buf[buf_len++] = 'v';
+                        buf[buf_len++] = '0';
+                        buf[buf_len++] = '0';
+                        buf[buf_len++] = '0';
+                        buf[buf_len++] = '1';
+                        buf[buf_len++] = '\r';
+                        break;
+                    case 'N':
+                        /* Serial number */
+                        buf[buf_len++] = 'N';
+                        buf[buf_len++] = 'F';
+                        buf[buf_len++] = 'F';
+                        buf[buf_len++] = 'F';
+                        buf[buf_len++] = 'F';
+                        buf[buf_len++] = '\r';
+                        break;
+                    case 'T':
+                        /* Extended message */
+                        if (read_ext_message(&tx_msg, current_cmd_data,
+                                             current_cmd_data_length) &&
+                                HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 't':
+                        /* Standard message */
+                        if (read_std_message(&tx_msg, current_cmd_data,
+                                             current_cmd_data_length) &&
+                                HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 'R':
+                        /* Extended RTR */
+                        if (read_ext_rtr(&tx_msg, current_cmd_data,
+                                         current_cmd_data_length) &&
+                                HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 'r':
+                        /* Standard RTR */
+                        if (read_std_rtr(&tx_msg, current_cmd_data,
+                                         current_cmd_data_length) &&
+                                HAL_CAN_Transmit(&hcan, 0) == HAL_OK) {
+                            buf[buf_len++] = '\r';
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case '_':
+                        /* Bootloader request */
+                        if (current_cmd_data[0] == '_' &&
+                                current_cmd_data[1] == 'd' &&
+                                current_cmd_data[2] == 'f' &&
+                                current_cmd_data[3] == 'u') {
+                            /*
+                            Set option bytes to force bootloader entry
+                            */
+                            set_dfu_option_bytes(1u);
+
+                            NVIC_SystemReset();
+                        } else {
+                            buf[buf_len++] = '\a';
+                        }
+                        break;
+                    case 'F':
+                        /* Read status flags -- return 4 hex digits */
+                    case 'Z':
+                        /* Timestamp on/off -- 0=off, 1=on */
+                    case 'M':
+                        /* Acceptance mask -- 8 hex digits */
+                    case 'm':
+                        /* Acceptance value -- 8 hex digits */
+                    case 's':
+                        /* Set bitrate register -- 6 hex digits */
+                    default:
+                        /* NACK */
+                        buf[buf_len++] = '\a';
+                        break;
                 }
 
-                if (i == rx_buffer_length) {
-                    /* Mark last packet as received */
-                    rx_buffer_length = i = 0;
-                    USBD_CDC_ReceivePacket(hUsbDevice_0);
+                usb_cdc_write(buf, buf_len);
+                current_cmd = current_cmd_data_length = 0;
+            } else if (current_cmd) {
+                /* Command data -- save it */
+                current_cmd_data[current_cmd_data_length++] = (uint8_t)ch;
+
+                /* Reset command state if the data is too long */
+                if (current_cmd_data_length == 32u) {
+                    current_cmd = current_cmd_data_length = 0;
                 }
+            } else {
+                /*
+                The first letter of a line is the command type --
+                don't bother validating as we can't NACK until the
+                data has been received.
+                */
+                current_cmd = (uint8_t)ch;
+            }
+        }
+
+        /*
+        Check the CAN controller for messages and send them to the host if
+        the channel is open
+        */
+        if (HAL_CAN_Receive(&hcan, CAN_FIFO0, 0) == HAL_OK && channel_open) {
+            /*
+            Format the message and send it to the host.
+
+            The data format for a standard ID message is:
+            tiiildddddddddddddddd\r
+
+            The data format for a standard ID RTR is:
+            riii\r
+
+            The data format for an extended ID message is:
+            Tiiiiiiiildddddddddddddddd\r
+
+            The data format for an extended ID RTR is:
+            Riiiiiiii\r
+            */
+            uint8_t line[EXT_MESSAGE_LEN];
+            uint8_t line_len = 0;
+
+            if (rx_msg.IDE == CAN_ID_EXT && rx_msg.RTR) {
+                line_len = write_ext_rtr(line, &rx_msg);
+            } else if (rx_msg.IDE == CAN_ID_EXT && !rx_msg.RTR) {
+                line_len = write_ext_message(line, &rx_msg);
+            } else if (rx_msg.IDE == CAN_ID_STD && rx_msg.RTR) {
+                line_len = write_std_rtr(line, &rx_msg);
+            } else if (rx_msg.IDE == CAN_ID_STD && !rx_msg.RTR) {
+                line_len = write_std_message(line, &rx_msg);
             }
 
             /*
-            Check the CAN controller for messages and process them if the
-            channel is open
+            Whole lines only: if the host isn't keeping up the frame is
+            dropped rather than truncated.
             */
-            if (HAL_CAN_Receive(&hcan, CAN_FIFO0, 0) == HAL_OK && hUsbDevice_0 &&
-                    channel_open) {
-                /*
-                Format the message and send it to the host.
-
-                The data format for a standard ID message is:
-                tiiildddddddddddddddd\r
-
-                The data format for a standard ID RTR is:
-                riii\r
-
-                The data format for an extended ID message is:
-                Tiiiiiiiildddddddddddddddd\r
-
-                The data format for an extended ID RTR is:
-                Riiiiiiii\r
-                */
-                uint8_t *write_location;
-
-                if (active_buffer_length + EXT_MESSAGE_LEN > TX_BUFFER_SIZE) {
-                    /*
-                    Reset buffer if we're too far behind -- use worst-case
-                    message length for calculation
-                    */
-                    active_buffer_length = 0;
-                }
-
-                write_location = &((active_buffer ? tx_buffer_1 : tx_buffer_0)[active_buffer_length]);
-
-                if (rx_msg.IDE == CAN_ID_EXT && rx_msg.RTR) {
-                    active_buffer_length += write_ext_rtr(
-                        write_location, &rx_msg);
-                } else if (rx_msg.IDE == CAN_ID_EXT && !rx_msg.RTR) {
-                    active_buffer_length += write_ext_message(
-                        write_location, &rx_msg);
-                } else if (rx_msg.IDE == CAN_ID_STD && rx_msg.RTR) {
-                    active_buffer_length += write_std_rtr(
-                        write_location, &rx_msg);
-                } else if (rx_msg.IDE == CAN_ID_STD && !rx_msg.RTR) {
-                    active_buffer_length += write_std_message(
-                        write_location, &rx_msg);
-                }
-            }
-
-            if (!hUsbDevice_0 || !hUsbDevice_0->pClassData) {
-                /* Reset TX buffer if USB is not connected */
-                active_buffer_length = 0;
-            } else if (active_buffer_length &&
-                        ((USBD_CDC_HandleTypeDef*)hUsbDevice_0->pClassData)->TxState == 0) {
-                /* Transmit the next buffer if one is available */
-                CDC_Transmit_FS(active_buffer ? tx_buffer_1 : tx_buffer_0,
-                                active_buffer_length);
-                active_buffer_length = 0;
-                active_buffer = active_buffer ? 0 : 1;
-            }
+            usb_cdc_write(line, line_len);
         }
     }
 }

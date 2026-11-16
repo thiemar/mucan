@@ -64,18 +64,14 @@ DEBUG_LEVEL       = 0
 OPTIM_FLAGS       = -Os
 LINKER_SCRIPT     = $(PROJECT).ld
 PROJECT_OBJECTS   = $(addprefix $(BUILD), \
-					  app/main.o app/stm32f0xx_it.o app/usb_device.o \
-					  app/usbd_cdc_if.o app/usbd_conf.o app/usbd_desc.o \
-					  app/vectors.o app/libc.o sys/stm32f0xx_hal.o \
-					  sys/stm32f0xx_hal_can.o sys/stm32f0xx_hal_cortex.o \
-					  sys/stm32f0xx_hal_dma.o sys/stm32f0xx_hal_flash.o \
+					  app/main.o app/stm32f0xx_it.o app/vectors.o app/libc.o \
+					  sys/stm32f0xx_hal.o sys/stm32f0xx_hal_can.o \
+					  sys/stm32f0xx_hal_cortex.o sys/stm32f0xx_hal_dma.o \
 					  sys/stm32f0xx_hal_flash.o sys/stm32f0xx_hal_flash_ex.o \
-					  sys/stm32f0xx_hal_gpio.o sys/stm32f0xx_hal_pcd.o \
-					  sys/stm32f0xx_hal_pcd_ex.o sys/stm32f0xx_hal_pwr.o \
+					  sys/stm32f0xx_hal_gpio.o sys/stm32f0xx_hal_pwr.o \
 					  sys/stm32f0xx_hal_pwr_ex.o sys/stm32f0xx_hal_rcc.o \
 					  sys/stm32f0xx_hal_rcc_ex.o sys/system_stm32f0xx.o \
-					  usb/usbd_cdc.o usb/usbd_core.o usb/usbd_ctlreq.o \
-					  usb/usbd_ioreq.o)
+					  usb/usb_cdc.o)
 PROJECT_INC_PATHS = -Iapp/ -Isys/ -Iusb/
 PROJECT_LIB_PATHS = -L.
 PROJECT_LIBRARIES =
@@ -108,6 +104,12 @@ LD_SYS_LIBS = $(SYS_LIBRARIES)
 ###############################################################################
 
 all: firmware/$(PROJECT).bin
+
+# Host-side tests of the USB driver against a model of the peripheral
+test:
+	$(MAKE) -C test
+
+.PHONY: all clean test
 
 clean:
 	rm -f $(PROJECT_OBJECTS)
