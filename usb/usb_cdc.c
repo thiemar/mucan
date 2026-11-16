@@ -369,29 +369,30 @@ static void ep_set_tx_status(uint8_t ep, uint16_t tx) {
     hw_epr_set(ep, (uint16_t)((r & EPR_RW) | EPR_CTR | ((r ^ tx) & EPR_STAT_TX)));
 }
 
-/* Stop transactions before changing a transfer's state. A transaction may
- * finish between the status read and toggle write: VALID then becomes NAK,
- * so the first write produces STALL rather than DISABLED. Read back and
- * finish disabling it before inspecting CTR flags or touching its buffer.
- * Keep this short register sequence uninterruptible: at 48 MHz the retry
- * finishes before the next full-speed token, so a CAN ISR cannot expose the
- * transient STALL to the host. SETUP can replace STALL, but only once because
- * CTR_RX then protects the received packet. */
-static void ep_disable(uint8_t ep, uint16_t status_mask) {
+/* Hold an endpoint at NAK before changing a transfer's state, so no packet
+ * moves while the driver decides what comes next. NAK, never DISABLED: a
+ * disabled endpoint gives the host no handshake at all, which hosts count as
+ * a transaction error and, after three, abort the transfer (seen on hardware
+ * as control requests failing whenever their handler took a few
+ * microseconds). A transaction can finish between the status read and the
+ * toggle write (VALID becomes NAK), turning that write into STALL; re-read
+ * until the field settles on NAK. Keep the sequence uninterruptible so the
+ * CAN ISR cannot stretch that transient STALL into the host's view. */
+static void ep_nak(uint8_t ep, uint16_t status_mask, uint16_t nak) {
     uint32_t mask = hw_irq_save();
     uint16_t r;
-    while (((r = hw_epr_get(ep)) & status_mask) != 0u) {
-        hw_epr_set(ep, (uint16_t)((r & (EPR_RW | status_mask)) | EPR_CTR));
+    while (((r = hw_epr_get(ep)) & status_mask) != nak) {
+        hw_epr_set(ep, (uint16_t)((r & EPR_RW) | EPR_CTR | ((r ^ nak) & status_mask)));
     }
     hw_irq_restore(mask);
 }
 
-static void ep_disable_rx(uint8_t ep) {
-    ep_disable(ep, EPR_STAT_RX);
+static void ep_nak_rx(uint8_t ep) {
+    ep_nak(ep, EPR_STAT_RX, RX_NAK);
 }
 
-static void ep_disable_tx(uint8_t ep) {
-    ep_disable(ep, EPR_STAT_TX);
+static void ep_nak_tx(uint8_t ep) {
+    ep_nak(ep, EPR_STAT_TX, TX_NAK);
 }
 
 static void ep_clear_ctr_rx(uint8_t ep) {
@@ -525,7 +526,7 @@ static bool ep_set_halt(uint16_t address, bool halt) {
 
     switch (address) {
         case EP_IN_ADDR:
-            ep_disable_tx(EP_IN);
+            ep_nak_tx(EP_IN);
             /* EP0 has higher priority than the bulk completion: a packet
              * may already have reached the host but still have CTR_TX set. */
             if (hw_epr_get(EP_IN) & EPR_CTR_TX) {
@@ -543,7 +544,7 @@ static bool ep_set_halt(uint16_t address, bool halt) {
             }
             return true;
         case EP_OUT_ADDR:
-            ep_disable_rx(EP_OUT);
+            ep_nak_rx(EP_OUT);
             /* Preserve an OUT packet acknowledged before this request,
              * including one whose completion usb_poll has not seen yet. */
             halted |= (uint8_t)(1u << EP_OUT);
@@ -575,17 +576,30 @@ static bool ep_set_halt(uint16_t address, bool halt) {
 /* Control transfers                                                         */
 /* ------------------------------------------------------------------------ */
 
+/* Set EP0's statuses for the next stage of a transfer. A SETUP (or OUT) that
+ * completes between the status read and write would otherwise leave this
+ * stage's packet or STALL armed for the next request. Hosts need
+ * microseconds to follow a SETUP with an IN, so holding both directions at
+ * NAK here is always in time; the pending transaction is handled on the
+ * next pass of usb_poll(). */
+static void ctrl_set_status(uint16_t rx, uint16_t tx) {
+    ep_set_status(EP_CTRL, rx, tx);
+    if (hw_epr_get(EP_CTRL) & EPR_CTR_RX) {
+        ep_nak(EP_CTRL, EPR_STAT_RX | EPR_STAT_TX, RX_NAK | TX_NAK);
+    }
+}
+
 static void ctrl_stall(void) {
     /* Protocol stall: the next SETUP is still accepted by the hardware */
     ctrl.state = CTRL_IDLE;
-    ep_set_status(EP_CTRL, RX_STALL, TX_STALL);
+    ctrl_set_status(RX_STALL, TX_STALL);
 }
 
 /* Zero-length IN packet for the status stage */
 static void ctrl_ack(void) {
     ctrl.state = CTRL_STATUS_IN;
     *btable(EP_CTRL, BT_COUNT_TX) = 0;
-    ep_set_status(EP_CTRL, RX_VALID, TX_VALID);
+    ctrl_set_status(RX_VALID, TX_VALID);
 }
 
 static void ctrl_in_packet(void) {
@@ -600,7 +614,7 @@ static void ctrl_in_packet(void) {
     }
 
     /* RX stays valid so the host can move to the status stage at any time */
-    ep_set_status(EP_CTRL, RX_VALID, TX_VALID);
+    ctrl_set_status(RX_VALID, TX_VALID);
 }
 
 static void ctrl_reply(const uint8_t *data, uint16_t len) {
@@ -625,7 +639,7 @@ static bool ctrl_receive(uint16_t len) {
     ctrl.out_len = len;
     ctrl.out_got = 0;
     ctrl.state = CTRL_DATA_OUT;
-    ep_set_status(EP_CTRL, RX_VALID, TX_NAK);
+    ctrl_set_status(RX_VALID, TX_NAK);
     return true;
 }
 
@@ -898,7 +912,7 @@ static void ctrl_out_received(void) {
          * stray packet: either way the transfer is over */
         ep_clear_ctr_rx(EP_CTRL);
         ctrl.state = CTRL_IDLE;
-        ep_set_status(EP_CTRL, RX_VALID, TX_NAK);
+        ctrl_set_status(RX_VALID, TX_NAK);
         return;
     }
 
@@ -915,7 +929,7 @@ static void ctrl_out_received(void) {
     if (ctrl.out_got < ctrl.out_len && n == EP0_SIZE) {
         /* usb_poll() disabled both directions; NAK any IN until the data
          * stage is complete rather than leaving the host without a reply */
-        ep_set_status(EP_CTRL, RX_VALID, TX_NAK);
+        ctrl_set_status(RX_VALID, TX_NAK);
     } else if (ctrl_out_complete()) {
         ctrl_ack();
     } else {
@@ -952,7 +966,7 @@ static void ctrl_in_sent(bool pending_rx) {
     }
 
     if (!pending_rx) {
-        ep_set_status(EP_CTRL, RX_VALID, TX_NAK);
+        ctrl_set_status(RX_VALID, TX_NAK);
     }
 }
 
@@ -1023,13 +1037,11 @@ void usb_poll(void) {
 
         switch (ep) {
             case EP_CTRL:
-                /* Freeze both directions before clearing CTR or preparing a
-                 * reply. A SETUP arriving before RX is disabled is caught by
-                 * the refreshed flags below; during this short window the
-                 * host retries it. Re-enabling RX and the reply together lets
-                 * hardware cancel that reply if another SETUP arrives later. */
-                ep_disable_rx(EP_CTRL);
-                ep_disable_tx(EP_CTRL);
+                /* Hold both directions at NAK before clearing CTR or
+                 * preparing a reply, then act on the refreshed flags. The
+                 * host keeps retrying NAKed tokens, and a SETUP is still
+                 * accepted (and supersedes this transfer) while NAKing. */
+                ep_nak(EP_CTRL, EPR_STAT_RX | EPR_STAT_TX, RX_NAK | TX_NAK);
                 epr = hw_epr_get(EP_CTRL);
                 if (epr & EPR_CTR_TX) {
                     /* A completed SET_ADDRESS status still takes effect,

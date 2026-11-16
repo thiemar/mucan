@@ -701,6 +701,87 @@ static void test_ctr_race(void) {
     }
 }
 
+/* Regression for hardware: the driver used to set EP0 to DISABLED while it
+ * handled a request. A disabled endpoint gives no handshake; hosts treat that
+ * as a transaction error and abort the transfer after three, so requests
+ * with slower handlers (string descriptors) failed on a real adapter. Here a
+ * host token is sent at every EP0 register write and must get NAK or ACK. */
+static char probe_kind; /* 'I' IN token, 'O' OUT token, 0 done */
+static int probe_skip, probe_silent;
+
+static void probe_host_token(void) {
+    uint8_t buf[64];
+    uint16_t n;
+    sim_handshake_t h;
+
+    if (probe_skip > 0) {
+        probe_skip--;
+        sim_before_next_write(0, probe_host_token);
+        return;
+    }
+    h = probe_kind == 'I' ? sim_in(address, 0, buf, &n) : sim_out(address, 0, NULL, 0);
+    if (h == SIM_TIMEOUT) {
+        probe_silent++;
+    }
+    if (h == SIM_ACK) {
+        probe_kind = 0; /* the host got its packet; stop probing */
+        return;
+    }
+    sim_before_next_write(0, probe_host_token);
+}
+
+static void test_endpoint_zero_always_handshakes(void) {
+    static const uint16_t requests[][3] = {
+        {0x0100, 0, 18},        /* device descriptor (constant) */
+        {0x0301, 0x0409, 255},  /* manufacturer string (built per request) */
+        {0x0303, 0x0409, 255},  /* serial number string (formats the UID) */
+        {0x0303, 0x0409, 2},    /* its 2-byte header, as hosts ask first */
+    };
+    uint8_t buf[64];
+    uint16_t n;
+
+    enumerate();
+    for (size_t r = 0; r < sizeof(requests) / sizeof(requests[0]); r++) {
+        for (int skip = 0; skip < 4; skip++) {
+            const uint8_t setup[8] = {0x80, 6, LO(requests[r][0]), HI(requests[r][0]),
+                                      LO(requests[r][1]), HI(requests[r][1]),
+                                      LO(requests[r][2]), HI(requests[r][2])};
+            uint16_t expected = requests[r][2] < 18 ? requests[r][2] : 0;
+
+            /* Data stage: IN tokens while the SETUP is being handled */
+            CHECK(sim_setup(address, setup) == SIM_ACK);
+            probe_kind = 'I';
+            probe_skip = skip;
+            probe_silent = 0;
+            sim_before_next_write(0, probe_host_token);
+            usb_poll();
+            sim_before_next_write(0, NULL);
+            CHECK(probe_silent == 0);
+            if (probe_kind) {
+                CHECK(sim_in(address, 0, buf, &n) == SIM_ACK);
+                CHECK(n > 0 && (!expected || n == expected) && buf[1] == (r ? 3 : 1));
+            }
+
+            /* Status stage: OUT tokens while the IN completion is handled */
+            probe_kind = 'O';
+            probe_skip = skip;
+            probe_silent = 0;
+            sim_before_next_write(0, probe_host_token);
+            usb_poll();
+            sim_before_next_write(0, NULL);
+            CHECK(probe_silent == 0);
+            if (probe_kind) {
+                CHECK(sim_out(address, 0, NULL, 0) == SIM_ACK);
+            }
+            usb_poll();
+            probe_kind = 0;
+            CHECK_MODEL();
+        }
+    }
+    CHECK(get_descriptor(1, 0, 18, buf) == 18);
+    CHECK_MODEL();
+}
+
 static const uint8_t abort_setup[8] = {0x80, 6, 0, 1, 0, 0, 18, 0};
 static int setup_write_count;
 static bool setup_accepted, setup_reply_seen;
@@ -712,18 +793,15 @@ static void probe_setup_reply(void) {
     uint16_t n;
     sim_handshake_t h = sim_in(address, 0, buf, &n);
 
-    CHECK(h == SIM_NAK || h == SIM_TIMEOUT || h == SIM_ACK);
+    /* NAK while the driver works; never silence, which hosts count as an
+     * error (three in a row abort the transfer) */
+    CHECK(h == SIM_NAK || h == SIM_ACK);
     if (h == SIM_ACK) {
         CHECK(n == 18 && buf[0] == 18 && buf[1] == 1);
         setup_reply_seen = true;
     } else {
         sim_before_next_write(0, probe_setup_reply);
     }
-}
-
-static void probe_setup_during_disable_retry(void) {
-    CHECK(sim_irq_masked());
-    probe_setup_reply();
 }
 
 static void abort_setup_at_write(void) {
@@ -733,14 +811,12 @@ static void abort_setup_at_write(void) {
         sim_before_next_write(0, abort_setup_at_write);
         return;
     }
+    /* EP0 only ever NAKs while the driver works, so SETUP is always taken.
+     * A real host needs microseconds before following it with an IN, so the
+     * reply is checked once usb_poll() returns, not mid-sequence. */
     h = sim_setup(address, abort_setup);
-    CHECK(h == SIM_ACK || h == SIM_TIMEOUT);
+    CHECK(h == SIM_ACK);
     setup_accepted = h == SIM_ACK;
-    if (setup_accepted) {
-        /* A SETUP during VALID-to-DISABLED can require a second write. */
-        CHECK(sim_irq_masked());
-        sim_before_next_write(0, probe_setup_during_disable_retry);
-    }
 }
 
 static void test_setup_aborts_pending_in(void) {
@@ -748,8 +824,9 @@ static void test_setup_aborts_pending_in(void) {
     uint8_t buf[64];
     uint16_t n;
 
-    /* Already pending, or arriving at each of the four register writes
-     * between an IN completion and arming the next descriptor packet. */
+    /* Already pending, or arriving at each register write between an IN
+     * completion and arming the next descriptor packet (there are three;
+     * the fourth case injects nothing and sends the SETUP afterwards). */
     for (int write = 0; write <= 4; write++) {
         enumerate();
         CHECK(sim_setup(address, config_setup) == SIM_ACK);
@@ -767,7 +844,6 @@ static void test_setup_aborts_pending_in(void) {
         usb_poll();
         sim_before_next_write(0, NULL);
         if (!setup_accepted) {
-            /* SETUP during the disabled interval is retried by the host. */
             CHECK(sim_setup(address, abort_setup) == SIM_ACK);
             usb_poll();
         }
@@ -831,6 +907,7 @@ int main(void) {
         {"set_interface_resets", test_set_interface_resets_endpoints},
         {"reset_and_reconfigure", test_reset_and_reconfigure},
         {"tx_empty_and_disconnect", test_tx_empty_and_disconnect},
+        {"endpoint_zero_always_handshakes", test_endpoint_zero_always_handshakes},
         {"ctr_race", test_ctr_race},
         {"setup_aborts_pending_in", test_setup_aborts_pending_in},
         {"address_status_setup", test_address_status_before_setup},
